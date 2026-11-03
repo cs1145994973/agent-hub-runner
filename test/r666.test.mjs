@@ -11,7 +11,7 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { autostartOff, autostartOn, autostartStatus, configTag, installCopy, LABEL, labelFor, logFileFor, ONLY_MAC, pickNode, plistPathFor, plistXml, truncateLogIfBig } from "../autostart.mjs";
+import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, configTag, installCopy, LABEL, labelFor, logFileFor, ONLY_MAC, pickNode, plistPathFor, plistXml, TASK_PREFIX, taskCmdFor, taskCmdText, taskNameFor, truncateLogIfBig } from "../autostart.mjs";
 import {
   decideAutostart, explainError, explainNetError, explainPairFailure, isNpx, loadConfig, main, NO_DIR, nodeTooOld, NPX_CMD, PAIR_ERR, pair,
   parsePairTarget, progName, readLock, RUNNER_VERSION, takeLock,
@@ -306,13 +306,43 @@ describe("R666 更傻瓜的安装配对", () => {
     assert.equal(truncateLogIfBig(path.join(tmp, "none.log"), 10), false);
   });
 
-  it("R12 要不要开机自启：--autostart / --no-autostart 优先；不是 Mac 不开（--autostart 说只支持 Mac）；Mac 终端里问，不是终端只提示", () => {
+  it("R12 要不要开机自启：--autostart / --no-autostart 优先；不是 Mac / Windows 不开；Mac 和 Windows 终端里问，不是终端只提示", () => {
     assert.equal(decideAutostart({ flag: true, platform: "darwin", tty: false }), "on");
+    assert.equal(decideAutostart({ flag: true, platform: "win32", tty: false }), "on");
     assert.equal(decideAutostart({ flag: true, platform: "linux", tty: true }), "unsupported");
     assert.equal(decideAutostart({ flag: false, platform: "darwin", tty: true }), "off");
     assert.equal(decideAutostart({ platform: "darwin", tty: true }), "ask");
+    assert.equal(decideAutostart({ platform: "win32", tty: true }), "ask");
+    assert.equal(decideAutostart({ platform: "win32", tty: false }), "hint");
     assert.equal(decideAutostart({ platform: "darwin", tty: false }), "hint");
     assert.equal(decideAutostart({ platform: "linux", tty: true }), "off");
+  });
+
+  it("R14 Windows 开机自启（假 schtasks、临时目录）：写包装脚本、建计划任务（登录时、普通权限）、马上起一次；off 删任务和脚本；默认配置任务名是 AgentHubRunner", async () => {
+    const env = { ...envFor("r14"), USERNAME: "chensen" };
+    mkdirSync(path.dirname(env.AGENT_RUNNER_CONFIG), { recursive: true });
+    writeFileSync(env.AGENT_RUNNER_CONFIG, "{}");
+    const calls = [];
+    const schtasks = async (a) => { calls.push(a); return a[0] === "/query" ? { code: 0, stdout: `"任务名","状态"\r\n"${taskNameFor(env.AGENT_RUNNER_CONFIG, env)}","Running"\r\n`, stderr: "" } : { code: 0, stdout: "", stderr: "" }; };
+    const r = await autostartOnWindows({ configFile: env.AGENT_RUNNER_CONFIG, version: "9.9.9", srcDir: root, execPath: "C:\\node.exe", env, schtasks });
+    const tag = createHash("sha256").update(env.AGENT_RUNNER_CONFIG).digest("hex").slice(0, 8);
+    assert.equal(r.task, `${TASK_PREFIX}-${tag}`);
+    assert.equal(taskNameFor(path.join(env.AGENT_RUNNER_HOME, "config.json"), env), TASK_PREFIX);
+    assert.equal(r.cmd, taskCmdFor(env.AGENT_RUNNER_CONFIG, env));
+    const binDir = path.join(env.AGENT_RUNNER_HOME, "bin");
+    assert.equal(readFileSync(r.cmd, "utf8"), taskCmdText({ node: "C:\\node.exe", binDir, configFile: env.AGENT_RUNNER_CONFIG, log: r.log }));
+    assert.equal(readFileSync(path.join(binDir, "current.txt"), "utf8"), "9.9.9");
+    assert.ok(existsSync(path.join(binDir, "9.9.9", "runner.mjs")));
+    assert.match(readFileSync(r.cmd, "utf8"), /AGENT_RUNNER_LAUNCHD=1/);
+    assert.match(readFileSync(r.cmd, "utf8"), /if %ERRORLEVEL%==0 goto end/);
+    const create = calls.find((a) => a[0] === "/create");
+    assert.ok(create.includes("/sc") && create.includes("onlogon"), "触发器是登录时");
+    assert.ok(create.includes("/ru") && create.includes("chensen"), "跑在当前用户下");
+    assert.ok(create.includes("/rl") && create.includes("limited"), "普通权限，不提权");
+    assert.ok(calls.some((a) => a[0] === "/run"), "马上起一次");
+    assert.equal((await autostartOffWindows({ configFile: env.AGENT_RUNNER_CONFIG, env, schtasks })).wasOn, true);
+    assert.equal(existsSync(r.cmd), false);
+    assert.ok(calls.some((a) => a[0] === "/delete" && a.includes("/f")));
   });
 
   it("R13 pair 码@地址（Mac、终端里答「是」）：配对成功 → 开机自启（假 launchctl），不在前台跑；答「否」+ --no-start：提示以后怎么开、现在运行 start；非终端只提示", async () => {

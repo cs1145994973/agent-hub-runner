@@ -27,7 +27,7 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { runOp } from "./ops.mjs";
 import { buildChangeRecord, changesDirFor, CHANGE_ID_RE, createChangeStore } from "./changes.mjs";
-import { autostartOff, autostartOn, autostartStatus, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
+import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
 export const PROTOCOL_VERSION = 1;
 /** npm 包名，也是装好后的命令名 */
@@ -478,10 +478,17 @@ export function takeLock(file = configPath(), { pid = process.pid, launchd = pro
   return { ok: true, release: () => { if (readLock(file)?.pid === pid) rmSync(lockPath(file), { force: true }); } };
 }
 
-/** 被网页断开 / 令牌失效后把这份配置的开机自启关掉（不然每次登录都白起一次）；不是 Mac、没开都不要紧 */
+// @意图#R725(2026-11-03): Windows 被断开时也关掉计划任务，不然下次登录又白起一次
+/** 被网页断开 / 令牌失效后把这份配置的开机自启关掉（不然每次登录都白起一次）；不是 Mac / Windows、没开都不要紧 */
 async function autostartOffQuietly(file, deps) {
-  if ((deps.platform ?? process.platform) !== "darwin") return false;
-  try { return (await autostartOff({ configFile: file, launchctl: deps.launchctl })).wasOn; } catch { return false; }
+  const platform = deps.platform ?? process.platform;
+  if (platform !== "darwin" && platform !== "win32") return false;
+  try {
+    const r = platform === "win32"
+      ? await autostartOffWindows({ configFile: file, schtasks: deps.schtasks })
+      : await autostartOff({ configFile: file, launchctl: deps.launchctl });
+    return r.wasOn;
+  } catch { return false; }
 }
 
 // @意图#R666(2026-10-29): 先拿锁（后台已在跑就提示退出 0）；开机自启时启动前日志超 5MB 清空、配置坏了/没配对也退出 0（不让 launchd 反复拉起）；
@@ -513,11 +520,13 @@ async function runStart(prog = progName(), deps = {}) {
   process.exit(0);
 }
 
-/** R666：配完要不要开机自启：flag（--autostart / --no-autostart）优先；不是 Mac 不开；是终端就问；不是终端（脚本、管道）不问、只提示 */
+// @意图#R725(2026-11-03): Windows 也支持开机自启（计划任务，见 autostart.mjs）。Mac 和 Windows 都问；别的系统不开。
+/** R666：配完要不要开机自启：flag（--autostart / --no-autostart）优先；不是 Mac / Windows 不开；是终端就问；不是终端（脚本、管道）不问、只提示 */
 export function decideAutostart({ flag, platform = process.platform, tty = !!(process.stdin.isTTY && process.stdout.isTTY) }) {
-  if (flag === true) return platform === "darwin" ? "on" : "unsupported";
+  const supported = platform === "darwin" || platform === "win32";
+  if (flag === true) return supported ? "on" : "unsupported";
   if (flag === false) return "off";
-  if (platform !== "darwin") return "off";
+  if (!supported) return "off";
   return tty ? "ask" : "hint";
 }
 
@@ -543,11 +552,16 @@ async function stopHolder(file) {
 
 const here = () => path.dirname(fileURLToPath(import.meta.url));
 // @意图#R666(2026-10-29): 开启自启：前台有一个在跑就先停掉它（不然后台那个起来就因为锁退出了），再交给 autostart.mjs（复制自己、写 plist、加载）
+// @意图#R725(2026-11-03): Windows 走计划任务（autostartOnWindows），Mac 走 launchd。提示里的「这台 Mac」按平台写。
 async function turnAutostartOn(file, prog, deps = {}) {
   const held = readLock(file);
   if (held && !held.launchd) await stopHolder(file);
-  const r = await autostartOn({ configFile: file, version: RUNNER_VERSION, srcDir: here(), launchctl: deps.launchctl, platform: deps.platform });
-  console.log(`已设开机自启：以后登录这台 Mac 会自动连上，不用开终端。现在已经在后台连着，可以关掉这个终端窗口了。\n日志：${r.log}\n关掉开机自启：${prog} autostart off`);
+  const platform = deps.platform ?? process.platform;
+  const r = platform === "win32"
+    ? await autostartOnWindows({ configFile: file, version: RUNNER_VERSION, srcDir: here(), execPath: deps.execPath, schtasks: deps.schtasks })
+    : await autostartOn({ configFile: file, version: RUNNER_VERSION, srcDir: here(), launchctl: deps.launchctl, platform });
+  const where = platform === "win32" ? "这台电脑" : "这台 Mac";
+  console.log(`已设开机自启：以后登录${where}会自动连上，不用开终端。现在已经在后台连着，可以关掉这个终端窗口了。\n日志：${r.log}\n关掉开机自启：${prog} autostart off`);
   return r;
 }
 
@@ -559,7 +573,7 @@ const usage = (prog) => `用法：
   ${prog} stop               停掉在跑的运行器
   ${prog} status             看配置、各 bot 的目录、在不在跑、开机自启
   ${prog} set-dir <bot_id> <路径>   直接指定这个 bot 的授权目录（和网页上点「选择目录」走同一套检查；弹窗弹不出来时用）
-  ${prog} autostart on|off|status   Mac 开机自启（on 也用来升级到新版本）
+  ${prog} autostart on|off|status   开机自启（Mac 用 launchd，Windows 用计划任务；on 也用来升级到新版本）
   ${prog} uninstall [--purge]       关掉自启、删掉本地副本和日志（--purge 连配置一起删）
   ${prog} --version
 目录请连上后在网页上每个 bot 的私聊里点输入框下面「我的电脑」那一行选，Mac / Windows 上会弹窗让你选。`;
@@ -604,15 +618,21 @@ export async function main(argv, prog = progName(), deps = {}) {
     const sub = a.positional[0] ?? "status";
     const file = configPath();
     if (sub === "on") { loadConfig(file); await turnAutostartOn(file, prog, deps); return; }
-    if (platform !== "darwin") { console.log(ONLY_MAC); return; }
+    if (platform !== "darwin" && platform !== "win32") { console.log(ONLY_MAC); return; }
+    // @意图#R725(2026-11-03): Windows 的 off / status 走计划任务，Mac 走 launchd
     if (sub === "off") {
-      const r = await autostartOff({ configFile: file, launchctl: deps.launchctl });
+      const r = platform === "win32"
+        ? await autostartOffWindows({ configFile: file, schtasks: deps.schtasks })
+        : await autostartOff({ configFile: file, launchctl: deps.launchctl });
       console.log(r.wasOn ? "已关掉开机自启（后台那个也停了）。" : "本来就没开开机自启。");
       return;
     }
     if (sub === "status") {
-      const st = await autostartStatus({ configFile: file, launchctl: deps.launchctl, platform });
-      console.log(st.installed ? `开机自启：开着（${st.loaded ? (st.pid ? `后台在跑，进程 ${st.pid}` : "已加载，现在没在跑") : "还没加载"}）\nplist：${st.plist}\n日志：${st.log}` : "开机自启：没开");
+      const st = platform === "win32"
+        ? await autostartStatusWindows({ configFile: file, schtasks: deps.schtasks })
+        : await autostartStatus({ configFile: file, launchctl: deps.launchctl, platform });
+      const where = st.task ? `计划任务：${st.task}` : `plist：${st.plist}`;
+      console.log(st.installed ? `开机自启：开着（${st.loaded ? (st.pid ? `后台在跑，进程 ${st.pid}` : "已加载，现在没在跑") : "还没加载"}）\n${where}\n日志：${st.log}` : "开机自启：没开");
       for (const p of st.problems) console.log(`注意：${p}`);
       return;
     }

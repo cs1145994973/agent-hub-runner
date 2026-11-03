@@ -10,6 +10,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+// @意图#R725(2026-11-03): Windows 开机自启用计划任务（schtasks）。和 Mac 一样：登录时拉起、崩溃了重新跑、正常退出不拉起。
 import os from "node:os";
 import path from "node:path";
 
@@ -21,7 +22,9 @@ export const THROTTLE_S = 10;
 export const COPY_FILES = ["runner.mjs", "ops.mjs", "edit.mjs", "changes.mjs", "autostart.mjs", "package.json"];
 /** 优先用的稳定 node 路径（Homebrew 升级 node 后这两个软链还在；nvm 的带版本号路径卸了就没了） */
 export const STABLE_NODES = ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
-export const ONLY_MAC = "开机自启目前只支持 Mac";
+export const ONLY_MAC = "开机自启目前只支持 Mac 和 Windows";
+// @意图#R725(2026-11-03): Windows 计划任务名前缀。默认配置是 AgentHubRunner，别的配置加路径 sha256 前 8 位，一份配置一个任务。
+export const TASK_PREFIX = "AgentHubRunner";
 
 const real = (p) => { try { return realpathSync(p); } catch { return path.resolve(p); } };
 
@@ -87,8 +90,10 @@ ${envXml}
 `;
 }
 
-/** 把运行器复制到 <home>/bin/<版本>/，current 软链指过去（先建临时链再改名，换的那一下不会断）。返回 current/runner.mjs 的路径。 */
-export function installCopy({ srcDir, version, env = process.env }) {
+// @意图#R725(2026-11-03): Windows 建软链要管理员权限（或开开发者模式），小白没有。所以 Windows 用一个 current.txt 记当前版本号，
+// 包装脚本读它来找要跑的 runner.mjs。Mac 仍用 current 软链（先建临时链再改名，换的那一下不会断）。
+/** 把运行器复制到 <home>/bin/<版本>/。返回要跑的 runner.mjs 路径。 */
+export function installCopy({ srcDir, version, env = process.env, platform = process.platform }) {
   const binRoot = path.join(runnerHome(env), "bin");
   const dest = path.join(binRoot, version);
   mkdirSync(dest, { recursive: true, mode: 0o700 });
@@ -97,6 +102,10 @@ export function installCopy({ srcDir, version, env = process.env }) {
       const from = path.join(srcDir, f);
       if (existsSync(from)) copyFileSync(from, path.join(dest, f));
     }
+  }
+  if (platform === "win32") {
+    writeFileSync(path.join(binRoot, "current.txt"), version);
+    return path.join(dest, "runner.mjs");
   }
   const cur = path.join(binRoot, "current");
   const tmp = path.join(binRoot, `.current-${process.pid}`);
@@ -177,6 +186,106 @@ export async function autostartStatus({ configFile, env = process.env, launchctl
 export function otherAutostarts(configFile, env = process.env) {
   const mine = `${labelFor(configFile, env)}.plist`;
   try { return readdirSync(launchAgentsDir(env)).filter((f) => f.startsWith(LABEL) && f.endsWith(".plist") && f !== mine); } catch { return []; }
+}
+
+// @意图#R725(2026-11-03): Windows 开机自启用计划任务，语义对齐 Mac 的 launchd：
+// - 触发器是「登录时」（/sc onlogon），跑在用户自己的桌面会话里。不能用 SYSTEM 或开机即跑（那样在 Session 0，选目录的窗口弹不出来）。
+// - 退出码不是 0 时重新跑（RestartCount 999、间隔 1 分钟），对齐 KeepAlive 的 SuccessfulExit=false：被网页断开、令牌失效、被顶掉都是 0 退出，不会被反复拉起；崩溃了才会重跑。
+// - 不设 /rl highest：普通权限就够，而且提权会弹 UAC，小白配不上。
+// - 任务跑一个 .cmd：计划任务的 /tr 不支持带空格的参数和重定向，node 装在 Program Files 里，所以包一层。日志追加到和 Mac 同一个文件。
+const psQuote = (s) => `'${String(s).replace(/'/g, "''")}'`;
+
+/** 计划任务名：默认配置 AgentHubRunner，别的配置加 sha8 后缀（对齐 labelFor） */
+export const taskNameFor = (configFile, env = process.env) => { const t = configTag(configFile, env); return t ? `${TASK_PREFIX}-${t}` : TASK_PREFIX; };
+
+/** 计划任务跑的包装脚本：<home>/bin/start-<任务名>.cmd，日志追加到 logFileFor 那个文件 */
+export function taskCmdFor(configFile, env = process.env) {
+  return path.join(runnerHome(env), "bin", `start-${taskNameFor(configFile, env)}.cmd`);
+}
+
+// @意图#R725(2026-11-03): 不靠计划任务的「失败重拉」。实测 schtasks 的 RestartOnFailure 在被 taskkill 强杀时不重拉
+// （任务记的结果是 1，但不再起）。所以在包装脚本里自己循环：退出码不是 0 就等 10 秒再跑，对齐 Mac 的
+// KeepAlive SuccessfulExit=false。正常退出（被网页断开、令牌失效、Ctrl-C，都是 0）不重跑。
+// 脚本路径不写死：从 current.txt 读当前版本号再拼（升级后不用改这个包装脚本）。binDir 是 <home>/bin。
+/** 生成包装脚本的内容。node 是绝对路径，配置路径经环境变量传（和 Mac 的 plist 一样）。 */
+export function taskCmdText({ node, binDir, configFile, log }) {
+  return [
+    "@echo off",
+    "setlocal EnableDelayedExpansion",
+    `set AGENT_RUNNER_CONFIG=${configFile}`,
+    "set AGENT_RUNNER_LAUNCHD=1",
+    ":loop",
+    "set /p VER=<\"" + binDir + "\\current.txt\"",
+    "\"" + node + "\" \"" + binDir + "\\!VER!\\runner.mjs\" start >> \"" + log + "\" 2>&1",
+    "if %ERRORLEVEL%==0 goto end",
+    "timeout /t 10 /nobreak > nul",
+    "goto loop",
+    ":end",
+    "",
+  ].join("\r\n");
+}
+
+/** 调 schtasks，返回 { code, stdout, stderr }，不抛错。AGENT_RUNNER_SCHTASKS 可换成假程序（测试用）。输出是 GBK，转成 UTF-8。 */
+export function runSchtasks(args, env = process.env) {
+  return new Promise((resolve) => {
+    execFile(env.AGENT_RUNNER_SCHTASKS || "schtasks", args, { encoding: "buffer" }, (err, stdout, stderr) => {
+      const dec = (b) => { try { return new TextDecoder("gbk").decode(b); } catch { return String(b ?? ""); } };
+      resolve({ code: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout: dec(stdout), stderr: dec(stderr) });
+    });
+  });
+}
+
+/** 开启开机自启（Windows）：复制自己、写包装脚本、建计划任务（登录时跑，失败重跑），马上起一次。返回 { task, cmd, node, log }。 */
+export async function autostartOnWindows({ configFile, version, srcDir, execPath = process.execPath, env = process.env, schtasks }) {
+  schtasks ??= (a) => runSchtasks(a, env);
+  const cfg = path.resolve(configFile);
+  if (!existsSync(cfg)) throw new Error(`还没配对：没有 ${cfg}，配对成功后才能设开机自启`);
+  const script = installCopy({ srcDir, version, env, platform: "win32" });
+  const node = pickNode(execPath);
+  const log = logFileFor(cfg, env);
+  mkdirSync(path.dirname(log), { recursive: true });
+  const cmd = taskCmdFor(cfg, env);
+  writeFileSync(cmd, taskCmdText({ node, binDir: path.join(runnerHome(env), "bin"), configFile: cfg, log }));
+  const name = taskNameFor(cfg, env);
+  const user = env.USERNAME;
+  if (!user) throw new Error("开机自启没设成：读不到当前用户名");
+  const args = ["/create", "/tn", name, "/tr", cmd, "/sc", "onlogon", "/ru", user, "/rl", "limited", "/f"];
+  const r = await schtasks(args);
+  if (r.code !== 0) throw new Error(`开机自启没设成：计划任务创建失败（${(r.stderr || r.stdout).trim() || r.code}）`);
+  // 崩溃重跑由包装脚本自己的循环做（见 taskCmdText）。这里只补「用电池也跑」，笔记本合盖不中断。
+  const ps = `$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0); Set-ScheduledTask -TaskName ${psQuote(name)} -Settings $s | Out-Null`;
+  await new Promise((resolve) => execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], () => resolve()));
+  await schtasks(["/run", "/tn", name]); // 马上起一次，不用等下次登录
+  return { task: name, cmd, node, log };
+}
+
+/** 关掉开机自启（Windows）：停掉并删计划任务、删包装脚本。返回 { wasOn }。 */
+export async function autostartOffWindows({ configFile, env = process.env, schtasks }) {
+  schtasks ??= (a) => runSchtasks(a, env);
+  const cfg = path.resolve(configFile);
+  const name = taskNameFor(cfg, env);
+  const cmd = taskCmdFor(cfg, env);
+  const wasOn = existsSync(cmd);
+  await schtasks(["/end", "/tn", name]);
+  await schtasks(["/delete", "/tn", name, "/f"]);
+  rmSync(cmd, { force: true });
+  return { wasOn };
+}
+
+/** 开机自启现在的样子（Windows）：有没有包装脚本、任务在不在、状态。 */
+export async function autostartStatusWindows({ configFile, env = process.env, schtasks }) {
+  schtasks ??= (a) => runSchtasks(a, env);
+  const cfg = path.resolve(configFile);
+  const name = taskNameFor(cfg, env);
+  const cmd = taskCmdFor(cfg, env);
+  const out = { supported: true, installed: existsSync(cmd), loaded: false, pid: null, task: name, cmd, log: logFileFor(cfg, env), problems: [] };
+  const r = await schtasks(["/query", "/tn", name, "/fo", "csv"]);
+  if (r.code === 0) {
+    out.loaded = true;
+    const row = r.stdout.split(/\r?\n/).find((l) => l.includes(name));
+    if (row && /running/i.test(row)) out.pid = 0; // 计划任务查不到进程号，0 表示在跑但不知道是哪个
+  }
+  return out;
 }
 
 /** 日志超过 max 字节就清空（launchd 用追加方式打开，清空后接着往后写不会乱）。清了返回 true。 */
