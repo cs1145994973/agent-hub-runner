@@ -1,0 +1,32 @@
+{
+  "name": "agent-hub-runner",
+  "version": "0.1.3",
+  "description": "agent-hub 的电脑运行器：配对后让你的 bot 在这台电脑上读写授权目录里的文件、跑命令（跑命令要你在网页上批准）",
+  "type": "module",
+  "bin": {
+    "agent-hub-runner": "bin/agent-hub-runner.mjs"
+  },
+  "files": [
+    "runner.mjs",
+    "ops.mjs",
+    "edit.mjs",
+    "changes.mjs",
+    "autostart.mjs",
+    "bin/agent-hub-runner.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cs1145994973/agent-hub-runner.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

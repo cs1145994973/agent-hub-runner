@@ -1,0 +1,67 @@
+[
+ {
+  "name": "sk 串",
+  "in": "bad key sk-fake0123456789abcdef here",
+  "out": "bad key sk-*** here"
+ },
+ {
+  "name": "单词里的 sk- 不算",
+  "in": "task-list risk-free disk-usage",
+  "out": "task-list risk-free disk-usage"
+ },
+ {
+  "name": "ghp 串",
+  "in": "push 失败 ghp_A1b2A1b2A1b2A1b2A1b2A1b2A1b2A1b2A1b2 无效",
+  "out": "push 失败 ghp_*** 无效"
+ },
+ {
+  "name": "连接串密码",
+  "in": "连不上 postgres://agent_hub:s3cr3t@127.0.0.1:5434/agent_hub",
+  "out": "连不上 postgres://agent_hub:***@127.0.0.1:5434/agent_hub"
+ },
+ {
+  "name": "连接串没密码不动",
+  "in": "postgres://u@127.0.0.1:1/x 和 redis://h:6379",
+  "out": "postgres://u@127.0.0.1:1/x 和 redis://h:6379"
+ },
+ {
+  "name": "私钥块（行数不变）",
+  "in": "a\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nAAAB\n-----END RSA PRIVATE KEY-----\nb",
+  "out": "a\n-----BEGIN RSA PRIVATE KEY-----\n***\n***\n-----END RSA PRIVATE KEY-----\nb"
+ },
+ {
+  "name": "截断没有 END 的私钥块",
+  "in": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn\nNzaC1",
+  "out": "-----BEGIN OPENSSH PRIVATE KEY-----\n***\n***"
+ },
+ {
+  "name": ".env 行",
+  "in": "DEEPSEEK_API_KEY=abc123\nexport GH_TOKEN=xyz\nDB_PASSWORD = p@ss w\nPORT=3220",
+  "out": "DEEPSEEK_API_KEY=***\nexport GH_TOKEN=***\nDB_PASSWORD = *** w\nPORT=3220"
+ },
+ {
+  "name": "yaml 行",
+  "in": "  secret: hunter2\n  password:\n  name: demo",
+  "out": "  secret: ***\n  password:\n  name: demo"
+ },
+ {
+  "name": "带引号的值",
+  "in": "const API_KEY = \"abc-123\";\n{\"apiKey\": \"zzz\", \"token\": \"\"}",
+  "out": "const API_KEY = \"***\";\n{\"apiKey\": \"***\", \"token\": \"\"}"
+ },
+ {
+  "name": "像但不是密钥名",
+  "in": "monkey = \"banana\"\ntokens = 5\nkeyboard: \"x\"",
+  "out": "monkey = \"banana\"\ntokens = 5\nkeyboard: \"x\""
+ },
+ {
+  "name": "报错里的 key 文字不动",
+  "in": "Your api key: ****cdef is invalid",
+  "out": "Your api key: ****cdef is invalid"
+ },
+ {
+  "name": "代码里不带引号的赋值不动",
+  "in": "  const token = getToken();",
+  "out": "  const token = getToken();"
+ }
+]

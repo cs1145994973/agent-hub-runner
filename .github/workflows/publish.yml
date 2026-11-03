@@ -1,0 +1,48 @@
+# 推 v* 标签时：校验版本 → 跑测试 → 用 npm Trusted Publisher (OIDC) 带来源证明发布。
+# npm Trusted Publisher 必须绑仓库 cs1145994973/agent-hub-runner、工作流文件名 publish.yml。
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure npm >= 11.5.1
+        run: |
+          npm install -g npm@latest
+          node -v
+          npm -v
+
+      - name: Check tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED="${TAG#v}"
+          ACTUAL="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG expected=$EXPECTED package.json=$ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "标签版本与 package.json 不一致：$TAG vs $ACTUAL"
+            exit 1
+          fi
+
+      - name: Test
+        run: npm test
+
+      - name: Publish
+        run: npm publish --provenance --access public
