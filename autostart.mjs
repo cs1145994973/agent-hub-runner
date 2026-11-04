@@ -124,11 +124,22 @@ export function runLaunchctl(args, env = process.env) {
 }
 const uid = () => (typeof process.getuid === "function" ? process.getuid() : 0);
 
+// @意图#R731(2026-11-04): plist 的 PATH 用终端里的，但去掉 npx 临时缓存、各级 node_modules/.bin、npm 自带的 node-gyp-bin 这些会变或会被清的目录；去重保序
+export function cleanPath(p) {
+  const seen = new Set();
+  return String(p || "").split(":").filter((d) => d && !d.includes("/_npx/") && !/\/node_modules\/\.bin\/?$/.test(d) && !d.includes("/node-gyp-bin") && !seen.has(d) && seen.add(d)).join(":") || "/usr/bin:/bin:/usr/sbin:/sbin";
+}
+
+/** 加载失败时给小白看的中文说明（带一条能直接复制的修复命令） */
+export const bootstrapHelp = (label, raw) => `开机自启没设成：macOS 拒绝加载后台任务（${raw}）。\n可以在终端里复制运行下面这条命令后，再运行一次 autostart on：\n  launchctl enable gui/$(id -u)/${label}\n还不行就重启一下电脑再试；仍然失败请把这段话截图发给我们。`;
+
 /**
  * 开启开机自启：复制自己、写 plist、（先卸掉旧的）再加载。加载后 launchd 马上起一个后台运行器（RunAtLoad）。
  * 返回 { label, plist, script, node, log }。
  */
-export async function autostartOn({ configFile, version, srcDir, execPath = process.execPath, env = process.env, launchctl, platform = process.platform }) {
+// @意图#R731(2026-11-04): 小白遇到「任务被 macOS 记成已禁用」（以前 launchctl disable 过，删 plist 也清不掉）时 bootstrap 报 5，自己处理掉：
+//   加载前先 launchctl enable（没禁用也无害）；还失败就等 1 秒再 enable + bootstrap 一次（刚 bootout 马上 bootstrap 偶尔也报 5）；仍失败给中文说明和修复命令
+export async function autostartOn({ configFile, version, srcDir, execPath = process.execPath, env = process.env, launchctl, platform = process.platform, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
   launchctl ??= (a) => runLaunchctl(a, env);
   if (platform !== "darwin") throw new Error(ONLY_MAC);
   const cfg = path.resolve(configFile);
@@ -138,14 +149,20 @@ export async function autostartOn({ configFile, version, srcDir, execPath = proc
   const label = labelFor(cfg, env);
   const log = logFileFor(cfg, env);
   mkdirSync(path.dirname(log), { recursive: true, mode: 0o700 });
-  const vars = { AGENT_RUNNER_CONFIG: cfg, AGENT_RUNNER_LAUNCHD: "1", PATH: env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin", LANG: env.LANG || "en_US.UTF-8" };
+  const vars = { AGENT_RUNNER_CONFIG: cfg, AGENT_RUNNER_LAUNCHD: "1", PATH: cleanPath(env.PATH), LANG: env.LANG || "en_US.UTF-8" };
   if (env.AGENT_RUNNER_HOME) vars.AGENT_RUNNER_HOME = env.AGENT_RUNNER_HOME;
   const plist = plistPathFor(cfg, env);
   mkdirSync(path.dirname(plist), { recursive: true });
   writeFileSync(plist, plistXml({ label, args: [node, script, "start"], env: vars, log }), { mode: 0o644 });
   await launchctl(["bootout", `gui/${uid()}/${label}`]); // 以前加载过（升级）：先卸掉，没有也不要紧
-  const r = await launchctl(["bootstrap", `gui/${uid()}`, plist]);
-  if (r.code !== 0) throw new Error(`开机自启没设成：launchctl bootstrap 失败（${(r.stderr || r.stdout).trim() || r.code}）`);
+  let r;
+  for (let i = 0; i < 2; i++) {
+    if (i) await sleep(1000);
+    await launchctl(["enable", `gui/${uid()}/${label}`]);
+    r = await launchctl(["bootstrap", `gui/${uid()}`, plist]);
+    if (r.code === 0) break;
+  }
+  if (r.code !== 0) throw new Error(bootstrapHelp(label, `launchctl bootstrap 失败：${(r.stderr || r.stdout).trim() || r.code}`));
   return { label, plist, script, node, log };
 }
 

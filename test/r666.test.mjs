@@ -11,7 +11,7 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, configTag, installCopy, LABEL, labelFor, logFileFor, ONLY_MAC, pickNode, plistPathFor, plistXml, TASK_PREFIX, taskCmdFor, taskCmdText, taskNameFor, truncateLogIfBig } from "../autostart.mjs";
+import { bootstrapHelp, cleanPath, autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, configTag, installCopy, LABEL, labelFor, logFileFor, ONLY_MAC, pickNode, plistPathFor, plistXml, TASK_PREFIX, taskCmdFor, taskCmdText, taskNameFor, truncateLogIfBig } from "../autostart.mjs";
 import {
   decideAutostart, explainError, explainNetError, explainPairFailure, isNpx, loadConfig, main, NO_DIR, nodeTooOld, NPX_CMD, PAIR_ERR, pair,
   parsePairTarget, progName, readLock, RUNNER_VERSION, takeLock,
@@ -272,7 +272,7 @@ describe("R666 更傻瓜的安装配对", () => {
     assert.ok(xml.includes("<key>AGENT_RUNNER_LAUNCHD</key>\n      <string>1</string>"));
     assert.ok(xml.includes("<key>PATH</key>"));
     const uid = process.getuid();
-    assert.deepEqual(calls, [`bootout gui/${uid}/${r.label}`, `bootstrap gui/${uid} ${r.plist}`]);
+    assert.deepEqual(calls, [`bootout gui/${uid}/${r.label}`, `enable gui/${uid}/${r.label}`, `bootstrap gui/${uid} ${r.plist}`]);
     // 副本能直接跑（开机不联网也能起来：不依赖 npx 缓存）
     const v = await run(process.execPath, [r.script, "--version"], { env });
     assert.equal(v.stdout.trim(), RUNNER_VERSION);
@@ -289,8 +289,23 @@ describe("R666 更傻瓜的安装配对", () => {
     assert.deepEqual(calls, [`bootout gui/${uid}/${r.label}`]);
     assert.deepEqual(await autostartOff({ configFile: env.AGENT_RUNNER_CONFIG, env, launchctl }), { wasOn: false });
     // bootstrap 失败：报清楚
-    await assert.rejects(autostartOn({ configFile: env.AGENT_RUNNER_CONFIG, version: "9.9.10", srcDir: root, env, platform: "darwin", launchctl: async (a) => (a[0] === "bootstrap" ? { code: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error" } : { code: 0, stdout: "", stderr: "" }) }), /开机自启没设成：launchctl bootstrap 失败（Bootstrap failed: 5/);
+    await assert.rejects(autostartOn({ configFile: env.AGENT_RUNNER_CONFIG, version: "9.9.10", srcDir: root, env, platform: "darwin", sleep: async () => {}, launchctl: async (a) => (a[0] === "bootstrap" ? { code: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error" } : { code: 0, stdout: "", stderr: "" }) }), (e) => /开机自启没设成/.test(e.message) && /Bootstrap failed: 5/.test(e.message) && e.message.includes(`launchctl enable gui/$(id -u)/${r.label}`));
     assert.equal(installCopy({ srcDir: path.join(home, "bin", "9.9.10"), version: "9.9.10", env }), path.join(home, "bin", "current", "runner.mjs")); // 从副本自己再开：不复制到自己身上
+  });
+
+  it("R15 R731：第一次 bootstrap 报 5 就等一下再 enable + bootstrap，成功不报错；PATH 去掉 npx 缓存和 node_modules/.bin", async () => {
+    const env = envFor("r12");
+    mkdirSync(path.dirname(env.AGENT_RUNNER_CONFIG), { recursive: true });
+    writeFileSync(env.AGENT_RUNNER_CONFIG, "{}");
+    env.PATH = "/Users/x/.npm/_npx/abc/node_modules/.bin:/Users/x/proj/node_modules/.bin:/usr/local/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin:/opt/homebrew/bin:/usr/bin:/opt/homebrew/bin";
+    const calls = []; const slept = []; let n = 0;
+    const launchctl = async (a) => { calls.push(a[0]); if (a[0] === "bootstrap" && n++ === 0) return { code: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error" }; return { code: 0, stdout: "", stderr: "" }; };
+    const r = await autostartOn({ configFile: env.AGENT_RUNNER_CONFIG, version: "9.9.11", srcDir: root, env, launchctl, platform: "darwin", sleep: async (ms) => { slept.push(ms); } });
+    assert.deepEqual(calls, ["bootout", "enable", "bootstrap", "enable", "bootstrap"]);
+    assert.deepEqual(slept, [1000]);
+    assert.ok(readFileSync(r.plist, "utf8").includes("<key>PATH</key>\n      <string>/opt/homebrew/bin:/usr/bin</string>"));
+    assert.equal(cleanPath(""), "/usr/bin:/bin:/usr/sbin:/sbin");
+    assert.match(bootstrapHelp("com.agenthub.runner", "x"), /launchctl enable gui\/\$\(id -u\)\/com\.agenthub\.runner/);
   });
 
   it("R11 pickNode：稳定软链和当前 node 是同一个文件就用软链，否则原样；日志超 5MB 清空", () => {
@@ -361,7 +376,7 @@ describe("R666 更傻瓜的安装配对", () => {
       const asked = [];
       await main(["pair", `CODE13@127.0.0.1:${srv.address().port}`], NPX_CMD, { platform: "darwin", tty: true, ask: async (q) => { asked.push(q); return true; }, launchctl });
       assert.deepEqual(asked, ["开机自动连上？以后不用开终端 (Y/n) "]);
-      assert.deepEqual(calls, ["bootout", "bootstrap"]);
+      assert.deepEqual(calls, ["bootout", "enable", "bootstrap"]);
       const cfg = JSON.parse(readFileSync(env.AGENT_RUNNER_CONFIG, "utf8"));
       assert.equal(cfg.server, `http://127.0.0.1:${srv.address().port}`);
       const out = logs.join("\n");
