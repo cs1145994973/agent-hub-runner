@@ -14,7 +14,7 @@ import { promisify } from "node:util";
 import { bootstrapHelp, cleanPath, autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, configTag, installCopy, LABEL, labelFor, logFileFor, ONLY_MAC, pickNode, plistPathFor, plistXml, TASK_PREFIX, taskCmdFor, taskCmdText, taskNameFor, truncateLogIfBig } from "../autostart.mjs";
 import {
   decideAutostart, explainError, explainNetError, explainPairFailure, isNpx, loadConfig, main, NO_DIR, nodeTooOld, NPX_CMD, PAIR_ERR, pair,
-  parsePairTarget, progName, readLock, RUNNER_VERSION, takeLock,
+  parsePairTarget, progName, readLock, RUNNER_VERSION, takeLock, newerVersion, waitNewHolder,
 } from "../runner.mjs";
 
 const run = promisify(execFile);
@@ -150,7 +150,7 @@ describe("R666 更傻瓜的安装配对", () => {
       assert.equal(l1.ok, true);
       assert.equal(statSync(`${file}.lock`).mode & 0o777, 0o600);
       const l2 = takeLock(file);
-      assert.deepEqual(l2, { ok: false, pid: other.pid, launchd: true });
+      assert.deepEqual(l2, { ok: false, pid: other.pid, launchd: true, version: RUNNER_VERSION, older: false });
       // start 命令：拿不到锁就提示、退出 0
       writeFileSync(file, JSON.stringify({ server: "http://127.0.0.1:9", device_id: "d", token: "t", bot_dirs: {} }));
       const r = await run(process.execPath, [runnerFile, "start"], { env: { ...process.env, AGENT_RUNNER_CONFIG: file } });
@@ -374,7 +374,7 @@ describe("R666 更傻瓜的安装配对", () => {
       const calls = [];
       const launchctl = async (a) => { calls.push(a[0]); return { code: 0, stdout: "", stderr: "" }; };
       const asked = [];
-      await main(["pair", `CODE13@127.0.0.1:${srv.address().port}`], NPX_CMD, { platform: "darwin", tty: true, ask: async (q) => { asked.push(q); return true; }, launchctl });
+      await main(["pair", `CODE13@127.0.0.1:${srv.address().port}`], NPX_CMD, { platform: "darwin", tty: true, ask: async (q) => { asked.push(q); return true; }, launchctl, waitNewHolder: async () => ({ pid: 1 }) });
       assert.deepEqual(asked, ["开机自动连上？以后不用开终端 (Y/n) "]);
       assert.deepEqual(calls, ["bootout", "enable", "bootstrap"]);
       const cfg = JSON.parse(readFileSync(env.AGENT_RUNNER_CONFIG, "utf8"));
@@ -405,6 +405,87 @@ describe("R666 更傻瓜的安装配对", () => {
       for (const k of Object.keys(process.env)) if (!(k in keep)) delete process.env[k];
       Object.assign(process.env, keep);
       srv.close();
+    }
+  });
+  it("R16（R732）新版顶掉旧版：版本比较；锁里没版本号 / 版本更旧的活进程被 start 顶掉并接管；更新版本的不顶；autostart on 不管谁拿锁都先停掉，等不到新版本拿锁就说没连上", async () => {
+    assert.equal(newerVersion("0.2.2", "0.2.1"), true);
+    assert.equal(newerVersion("0.2.2", null), true);
+    assert.equal(newerVersion("0.2.2", "0.2.2"), false);
+    assert.equal(newerVersion("0.2.2", "0.10.0"), false);
+    assert.equal(newerVersion("1.0.0", "1.0.0-beta"), true);
+    const file = path.join(tmp, "r16", "config.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ server: "http://127.0.0.1:9", device_id: "d", token: "t", bot_dirs: {} }));
+    const dummy = () => spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000)"]);
+    const startAndWait = (re) => new Promise((resolve) => {
+      const ch = spawn(process.execPath, [runnerFile, "start"], { env: { ...process.env, AGENT_RUNNER_CONFIG: file } });
+      let out = ""; const done = () => resolve({ ch, out });
+      const t = setTimeout(done, 8000);
+      const on = (d) => { out += d; if (re.test(out)) { clearTimeout(t); done(); } };
+      ch.stdout.on("data", on); ch.stderr.on("data", on);
+    });
+    // 1) 老锁（没版本号，0.2.1 以前的写法）
+    const old = dummy();
+    try {
+      await sleep(100);
+      writeFileSync(`${file}.lock`, JSON.stringify({ pid: old.pid, launchd: true }));
+      const { ch, out } = await startAndWait(/已顶掉旧版本/);
+      try {
+        assert.match(out, new RegExp(`已顶掉旧版本 （0\\.2\\.1 以前）（进程 ${old.pid}），现在是 ${RUNNER_VERSION.replace(/\./g, "\\.")}`), out);
+        await sleep(100);
+        assert.notEqual(old.exitCode ?? old.signalCode, null, "旧进程退出了");
+        const l = readLock(file);
+        assert.equal(l.pid, ch.pid); assert.equal(l.version, RUNNER_VERSION);
+      } finally { ch.kill("SIGTERM"); await new Promise((r) => ch.once("exit", r)); }
+    } finally { old.kill(); }
+    // 2) 版本更旧的
+    const old2 = dummy();
+    try {
+      await sleep(100);
+      writeFileSync(`${file}.lock`, JSON.stringify({ pid: old2.pid, launchd: false, version: "0.0.1" }));
+      const { ch, out } = await startAndWait(/已顶掉旧版本 0\.0\.1/);
+      try { assert.match(out, /已顶掉旧版本 0\.0\.1/, out); } finally { ch.kill("SIGTERM"); await new Promise((r) => ch.once("exit", r)); }
+    } finally { old2.kill(); }
+    // 3) 更新版本的：不顶，照旧提示
+    const newer = dummy();
+    try {
+      await sleep(100);
+      writeFileSync(`${file}.lock`, JSON.stringify({ pid: newer.pid, launchd: true, version: "99.0.0" }));
+      const { ch, out } = await startAndWait(/已经在后台连着/);
+      await new Promise((r) => (ch.exitCode !== null ? r() : ch.once("exit", r)));
+      assert.ok(out.includes(`已经在后台连着，不用再开（进程 ${newer.pid}，开机自启起的）`), out);
+      assert.equal(newer.exitCode, null, "更新版本的没被停");
+    } finally { newer.kill(); }
+    // 4) waitNewHolder：版本对、进程活着才算
+    const h = dummy();
+    try {
+      await sleep(100);
+      writeFileSync(`${file}.lock`, JSON.stringify({ pid: h.pid, launchd: true, version: "7.7.7" }));
+      assert.equal((await waitNewHolder(file, { version: "7.7.7", ms: 300, step: 50 }))?.pid, h.pid);
+      assert.equal(await waitNewHolder(file, { version: "8.8.8", ms: 300, step: 50 }), null);
+    } finally { h.kill(); }
+    // 5) autostart on：开机自启起的同版本也先停掉；等不到新版本拿锁 → 说没连上、给日志
+    const keep = { ...process.env };
+    const logs = []; const origLog = console.log; console.log = (...a) => { logs.push(a.join(" ")); };
+    const held = dummy();
+    try {
+      await sleep(100);
+      const env = envFor("r16");
+      Object.assign(process.env, env);
+      mkdirSync(path.dirname(env.AGENT_RUNNER_CONFIG), { recursive: true });
+      writeFileSync(env.AGENT_RUNNER_CONFIG, JSON.stringify({ server: "http://127.0.0.1:9", device_id: "d", token: "t", bot_dirs: {} }));
+      writeFileSync(`${env.AGENT_RUNNER_CONFIG}.lock`, JSON.stringify({ pid: held.pid, launchd: true, version: RUNNER_VERSION }));
+      const launchctl = async () => ({ code: 0, stdout: "", stderr: "" });
+      await main(["autostart", "on"], NPX_CMD, { platform: "darwin", launchctl, waitNewHolder: async () => null });
+      await sleep(100);
+      assert.notEqual(held.exitCode ?? held.signalCode, null, "开机自启起的也被停了");
+      const out = logs.join("\n");
+      assert.ok(out.includes("等了 10 秒后台还没连上"), out);
+      assert.ok(!out.includes("已设开机自启"), out);
+    } finally {
+      console.log = origLog; held.kill();
+      for (const k of Object.keys(process.env)) if (!(k in keep)) delete process.env[k];
+      Object.assign(process.env, keep);
     }
   });
 });

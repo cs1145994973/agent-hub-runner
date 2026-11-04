@@ -510,12 +510,22 @@ export const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } ca
  * 拿锁：别的活着的进程拿着就返回 { ok: false, pid, launchd }；否则写上自己（600）返回 { ok: true, release }。
  * 进程死了留下的旧锁直接覆盖。
  */
+/** R732：a 比 b 新（只比 x.y.z；带预发布后缀的算旧一点；b 不是版本号 = 很旧） */
+export function newerVersion(a, b) {
+  const re = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/;
+  const pa = re.exec(String(a ?? "")); const pb = re.exec(String(b ?? ""));
+  if (!pa) return false;
+  if (!pb) return true;
+  for (let i = 1; i <= 3; i++) { const d = Number(pa[i]) - Number(pb[i]); if (d) return d > 0; }
+  return !String(a).includes("-") && String(b).includes("-");
+}
+// @意图#R732(2026-11-04): 锁里记版本号；拿不到锁时告诉调用方对方是不是旧版本（older：锁里没版本号或比我旧），旧的由 runStart 顶掉
 // @意图#R666(2026-10-29): 防互踢（king 定必须做）：开机自启的在后台跑着，再在终端里 start 就提示「已经在后台连着」退出，不再两个互相顶
-export function takeLock(file = configPath(), { pid = process.pid, launchd = process.env.AGENT_RUNNER_LAUNCHD === "1" } = {}) {
+export function takeLock(file = configPath(), { pid = process.pid, launchd = process.env.AGENT_RUNNER_LAUNCHD === "1", version = RUNNER_VERSION } = {}) {
   const cur = readLock(file);
-  if (cur && cur.pid !== pid && pidAlive(cur.pid)) return { ok: false, pid: cur.pid, launchd: !!cur.launchd };
+  if (cur && cur.pid !== pid && pidAlive(cur.pid)) return { ok: false, pid: cur.pid, launchd: !!cur.launchd, version: cur.version ?? null, older: newerVersion(version, cur.version) };
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  writeFileSync(lockPath(file), `${JSON.stringify({ pid, launchd, started_at: new Date().toISOString() })}\n`, { mode: 0o600 });
+  writeFileSync(lockPath(file), `${JSON.stringify({ pid, launchd, version, started_at: new Date().toISOString() })}\n`, { mode: 0o600 });
   return { ok: true, release: () => { if (readLock(file)?.pid === pid) rmSync(lockPath(file), { force: true }); } };
 }
 
@@ -532,6 +542,7 @@ async function autostartOffQuietly(file, deps) {
   } catch { return false; }
 }
 
+// @意图#R732(2026-11-04): 拿锁时发现拿着锁的是旧版本（或没记版本的老运行器）就先让它退出再接管，客户升级后不用自己停旧进程；同版本或更新的照旧提示退出
 // @意图#R666(2026-10-29): 先拿锁（后台已在跑就提示退出 0）；开机自启时启动前日志超 5MB 清空、配置坏了/没配对也退出 0（不让 launchd 反复拉起）；
 // 结束一律退出码 0（Ctrl-C、被网页断开、令牌失效、被顶掉），被断开 / 令牌失效时顺手关掉自启
 // @意图#R663(2026-10-29): 前台跑 start，Ctrl-C 断开（pair --start 和 start 共用）
@@ -544,7 +555,14 @@ async function runStart(prog = progName(), deps = {}) {
     if (background) { console.error(explainError(e)); process.exit(0); }
     throw e;
   }
-  const lock = takeLock(file);
+  let lock = takeLock(file);
+  if (!lock.ok && lock.older) {
+    // R732：后台是旧版本（升级前起的那个还在内存里）：让它退出，我来接
+    const old = lock;
+    await stopPid(old.pid);
+    lock = takeLock(file);
+    if (lock.ok) say(`已顶掉旧版本 ${old.version ?? "（0.2.1 以前）"}（进程 ${old.pid}），现在是 ${RUNNER_VERSION}`);
+  }
   if (!lock.ok) {
     console.log(`已经在后台连着，不用再开（进程 ${lock.pid}${lock.launchd ? "，开机自启起的" : ""}）。要停掉它：${prog} stop`);
     process.exit(0);
@@ -586,22 +604,40 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function stopHolder(file) {
   const l = readLock(file);
   if (!l || l.pid === process.pid || !pidAlive(l.pid)) return null;
-  try { process.kill(l.pid, "SIGTERM"); } catch { /* 已经没了 */ }
-  for (let i = 0; i < 50 && pidAlive(l.pid); i++) await sleep(100);
+  await stopPid(l.pid);
   return l;
+}
+/** R732：发 SIGTERM 让它正常退出（退出码 0，launchd 不会再拉起），等最多 5 秒 */
+async function stopPid(pid) {
+  try { process.kill(pid, "SIGTERM"); } catch { /* 已经没了 */ }
+  for (let i = 0; i < 50 && pidAlive(pid); i++) await sleep(100);
+}
+/** R732：等新起的后台运行器拿到锁（锁里是 version 且进程活着），最多 ms 毫秒；拿到返回锁信息，超时 null */
+export async function waitNewHolder(file, { version = RUNNER_VERSION, ms = 10000, step = 200 } = {}) {
+  for (let t = 0; ; t += step) {
+    const l = readLock(file);
+    if (l && l.pid !== process.pid && l.version === version && pidAlive(l.pid)) return l;
+    if (t >= ms) return null;
+    await sleep(step);
+  }
 }
 
 const here = () => path.dirname(fileURLToPath(import.meta.url));
 // @意图#R666(2026-10-29): 开启自启：前台有一个在跑就先停掉它（不然后台那个起来就因为锁退出了），再交给 autostart.mjs（复制自己、写 plist、加载）
 // @意图#R725(2026-11-03): Windows 走计划任务（autostartOnWindows），Mac 走 launchd。提示里的「这台 Mac」按平台写。
+// @意图#R732(2026-11-04): 不管拿着锁的是终端里的还是开机自启起的（包括别的标签起的旧版本），一律先停掉；装好后等新版本真的拿到锁才报「已设开机自启」，没接上就说清楚、给日志位置
 async function turnAutostartOn(file, prog, deps = {}) {
-  const held = readLock(file);
-  if (held && !held.launchd) await stopHolder(file);
+  await stopHolder(file);
   const platform = deps.platform ?? process.platform;
   const r = platform === "win32"
     ? await autostartOnWindows({ configFile: file, version: RUNNER_VERSION, srcDir: here(), execPath: deps.execPath, schtasks: deps.schtasks })
     : await autostartOn({ configFile: file, version: RUNNER_VERSION, srcDir: here(), launchctl: deps.launchctl, platform });
   const where = platform === "win32" ? "这台电脑" : "这台 Mac";
+  const got = await (deps.waitNewHolder ?? waitNewHolder)(file, { version: RUNNER_VERSION });
+  if (!got) {
+    console.log(`开机自启已经装好（${RUNNER_VERSION}），但等了 10 秒后台还没连上。可以看日志找原因：${r.log}\n过一会儿可以再运行一次：${prog} autostart on`);
+    return r;
+  }
   console.log(`已设开机自启：以后登录${where}会自动连上，不用开终端。现在已经在后台连着，可以关掉这个终端窗口了。\n日志：${r.log}\n关掉开机自启：${prog} autostart off`);
   return r;
 }
