@@ -18,8 +18,9 @@ export const LABEL = "com.agenthub.runner";
 export const LOG_MAX_BYTES = 5 * 1024 * 1024;
 export const THROTTLE_S = 10;
 /** 复制到 ~/.agent-runner/bin/<版本>/ 的文件（package.json 用来读版本号） */
+// @意图#R729(2026-11-04): 多复制 browser.mjs（runner.mjs 要 import 它）
 // @意图#R690(2026-11-01): 多复制 changes.mjs（runner.mjs 要 import 它，少了开机自启的副本起不来）
-export const COPY_FILES = ["runner.mjs", "ops.mjs", "edit.mjs", "changes.mjs", "autostart.mjs", "package.json"];
+export const COPY_FILES = ["runner.mjs", "ops.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "autostart.mjs", "package.json"];
 /** 优先用的稳定 node 路径（Homebrew 升级 node 后这两个软链还在；nvm 的带版本号路径卸了就没了） */
 export const STABLE_NODES = ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
 export const ONLY_MAC = "开机自启目前只支持 Mac 和 Windows";

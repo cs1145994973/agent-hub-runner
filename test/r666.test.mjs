@@ -263,7 +263,7 @@ describe("R666 更傻瓜的安装配对", () => {
     assert.equal(r.script, path.join(home, "bin", "current", "runner.mjs"));
     assert.equal(readlinkSync(path.join(home, "bin", "current")), "9.9.9");
     assert.ok(lstatSync(path.join(home, "bin", "current")).isSymbolicLink());
-    for (const f of ["runner.mjs", "ops.mjs", "edit.mjs", "changes.mjs", "autostart.mjs", "package.json"]) assert.ok(existsSync(path.join(home, "bin", "9.9.9", f)), f);
+    for (const f of ["runner.mjs", "ops.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "autostart.mjs", "package.json"]) assert.ok(existsSync(path.join(home, "bin", "9.9.9", f)), f);
     assert.equal(r.node, pickNode(process.execPath));
     const xml = readFileSync(r.plist, "utf8");
     assert.equal(r.plist, path.join(env.AGENT_RUNNER_LAUNCH_AGENTS, `${LABEL}.${tag}.plist`));

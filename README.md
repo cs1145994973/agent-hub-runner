@@ -1,3 +1,4 @@
+<!-- @意图#R729(2026-11-04): 加 browser install / status 和「bot 的浏览器」一节（0.2.0） -->
 <!-- @意图#R690(2026-11-01): 加「改动记录」一节：存在哪、打码、64 KB、30 天、怎么删 -->
 <!-- @意图#R666(2026-10-29): 改成不用全局安装的 npx 一条命令（码@地址）、Mac 开机自启、stop / uninstall、常见报错 -->
 <!-- @意图#R664(2026-10-29): npm 包 agent-hub-runner 的说明（随包发布）：给客户看的安装、配对、再连、查看、断开、卸载和安全提示 -->
@@ -48,6 +49,8 @@ npx -y agent-hub-runner@latest autostart off   # 关掉开机自启
 npx -y agent-hub-runner@latest autostart status
 npx -y agent-hub-runner@latest stop            # 停掉在跑的运行器（开机自启的下次开机还会起）
 npx -y agent-hub-runner@latest uninstall       # 关掉开机自启、删掉复制的程序；会问要不要删配置
+npx -y agent-hub-runner@latest browser install # 给 bot 装它自己的浏览器（0.2.0 起，约 200MB，只要一次）
+npx -y agent-hub-runner@latest browser status  # 看浏览器装没装
 ```
 
 开机自启时，程序复制到 `~/.agent-runner/bin/<版本>/`，日志在 `~/.agent-runner/logs/runner.log`（超过 5MB 自动清空）。网页上提示「有新版本」时，按提示运行那一条升级命令。
@@ -80,7 +83,16 @@ npx -y agent-hub-runner@latest uninstall       # 关掉开机自启、删掉复�
 - 存之前会把像密钥的字符串换成 `***`（`sk-…`、`ghp_…`、连接串里的密码、私钥、`XXX_KEY=…` 这类赋值）；每条最多 64 KB；只留 30 天，过期自动删。电脑不在线时网页上看不到。
 - 不想留：直接删掉 `edits/` 文件夹，不影响别的。
 
+## bot 的浏览器（0.2.0 起）
+
+- bot 能在你电脑上用一只**它自己的浏览器**（独立的 Chromium，不碰你平时用的浏览器）。先运行一次 `npx -y agent-hub-runner@latest browser install`：装到 `~/.agent-runner/browser/`（playwright-core）和 `~/.agent-runner/browsers/`（Chromium）。先走官方源，下不动会自动换国内镜像（npmmirror）。装好不用重启运行器。
+- 每个 bot 一个资料目录 `~/.agent-runner/browser-profiles/<bot>/`，登录状态会保存。平时在后台（没有窗口）跑，闲 10 分钟自动关。
+- 要登录、扫码、过验证码：在网页「我的电脑」抽屉里点「打开 bot 的浏览器」，会弹出这个 bot 的浏览器窗口，你弄好后直接关掉窗口，bot 接着在后台用。
+- 不想让 bot 用浏览器：网页右栏「bot设置」里取消勾「允许用浏览器」。想清掉登录状态：删掉那个 bot 的资料目录。
+- 卸载：删掉 `~/.agent-runner/browser`、`~/.agent-runner/browsers`、`~/.agent-runner/browser-profiles` 三个文件夹。
+
 ## 安全提示
 
 - 别把放着密钥、令牌的文件夹授权出去：bot 在授权文件夹里读、写、改文件不用你批准。
 - 跑命令前网页上会弹批准卡片，看清命令再点「允许一次」；命令本身能碰到文件夹以外的东西（没有沙箱）。
+- bot 用浏览器不弹批准卡片，能打开任何网址；在 bot 的浏览器里登录过的网站，bot 都能以你的身份操作。别在里面登录你不想让 bot 碰的账号（网银、支付等）。

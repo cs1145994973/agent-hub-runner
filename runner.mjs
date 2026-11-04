@@ -27,6 +27,7 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { runOp } from "./ops.mjs";
 import { buildChangeRecord, changesDirFor, CHANGE_ID_RE, createChangeStore } from "./changes.mjs";
+import { browserStatus, createBrowserManager, installBrowser } from "./browser.mjs";
 import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
 export const PROTOCOL_VERSION = 1;
@@ -303,8 +304,12 @@ const wsUrlOf = (server) => `${server.replace(/^http/, "ws")}/devices/ws`;
 // @意图#R639(2026-10-27已废弃): 目录不再是连接时固定的常量；没目录时 call 一律拒绝；pick_dir 选完检查、写回配置（600）、回 dir_result（R640 改成按 bot 分）
 // @意图#R690(2026-11-01): write / edit 带 change_id（服务器记灰字时生成的 auto_id）就在写改成功后存一份改动记录（存失败只记日志）；
 // 新消息 change_get {id, change_id} → change_result {id, ok:true, found, record}，不看这个 bot 有没有目录（换了目录也能看旧记录）
-export function createSession(cfg, { log = say, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), changes } = {}) {
+// @意图#R729(2026-11-04): 新消息 browser {id, bot_id, action, args} → result（截图或元素清单）、browser_open {id, bot_id} → result（网页点「打开 bot 的浏览器」）；
+// 浏览器不看这个 bot 有没有选目录（资料目录在 ~/.agent-runner/browser-profiles/<bot_id>/，和授权目录无关）；断线不关浏览器（重连后接着用）
+export function createSession(cfg, { log = say, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), changes, browser } = {}) {
   let dirs = botDirsOf(cfg); // bot_id → 授权目录
+  let browsers = browser; // R729：每个 bot 一只浏览器，用到时才建
+  const browserMgr = () => (browsers ??= createBrowserManager({ log }));
   const jobs = new Map(); // 调用 id → AbortController
   const picks = new Map(); // 弹窗 id → AbortController
   let store = changes; // 改动记录（R690），用到时才建
@@ -339,6 +344,34 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       send({ type: "result", id, ok: false, error: e?.message ?? String(e) });
     } finally {
       jobs.delete(id);
+    }
+  }
+
+  // @意图#R729(2026-11-04): bot 用浏览器：全部自动允许（不弹卡）；打字只记字数（可能是密码）
+  async function handleBrowser(send, msg) {
+    const { id } = msg;
+    const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
+    const action = typeof msg.action === "string" ? msg.action : "";
+    const args = msg.args && typeof msg.args === "object" ? msg.args : {};
+    if (!bot) { send({ type: "result", id, ok: false, error: "缺 bot_id" }); return; }
+    log(`[${bot}] 浏览器：${action}${action === "open" ? ` ${args.url ?? ""}` : action === "type" ? `（${String(args.text ?? "").length} 个字）` : ""}`);
+    try {
+      const res = await browserMgr().run(bot, action, args);
+      send({ type: "result", id, ok: true, ...res });
+    } catch (e) {
+      send({ type: "result", id, ok: false, error: e?.message ?? String(e) });
+    }
+  }
+  // @意图#R729(2026-11-04): 网页点「打开 bot 的浏览器」：在这台电脑上弹出有窗口的浏览器（后台的换成有窗口的，恢复打开的网址）
+  async function handleBrowserOpen(send, msg) {
+    const { id } = msg;
+    const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
+    if (!bot) { send({ type: "result", id, ok: false, error: "缺 bot_id" }); return; }
+    try {
+      const r = await browserMgr().openHeaded(bot);
+      send({ type: "result", id, ok: true, bot_id: bot, already: !!r.already, urls: r.urls ?? [] });
+    } catch (e) {
+      send({ type: "result", id, ok: false, bot_id: bot, error: e?.message ?? String(e) });
     }
   }
 
@@ -377,6 +410,8 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       if (msg.type === "call") return handleCall(send, msg);
       if (msg.type === "pick_dir") return handlePick(send, msg);
       if (msg.type === "change_get") return handleChangeGet(send, msg);
+      if (msg.type === "browser") return handleBrowser(send, msg); // R729
+      if (msg.type === "browser_open") return handleBrowserOpen(send, msg); // R729
       if (msg.type === "abort") { jobs.get(msg.id)?.abort(); picks.get(msg.id)?.abort(); }
       return undefined;
     },
@@ -386,6 +421,8 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       jobs.clear();
       picks.clear();
     },
+    /** R729：运行器退出时关掉所有 bot 的浏览器 */
+    closeBrowsers() { return browsers ? browsers.closeAll() : Promise.resolve(); },
   };
 }
 
@@ -396,6 +433,8 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
 // @意图#R666(2026-10-29): hello 多报 runner_version（网页提示有新版本）和 autostart（是不是开机自启起的，网页据此给升级命令）；
 // 服务器用 4409 顶掉这条（同一份配置又开了一个）：不再重连、结束（"replaced"）；连不上时只在第一次和之后每 30 次打一行，开机自启没网时日志不刷屏；
 // 连上那句不再说「右栏」，开机自启时不说「按 Ctrl-C」
+// @意图#R729(2026-11-04): hello 和心跳多报浏览器装没装（browser: {installed, version}），网页抽屉据此显示「未安装」和安装命令；装好后不用重启，下一次心跳就更新；
+// 停掉时关掉所有 bot 的浏览器
 // @意图#R640(2026-10-27): hello 报 bot→目录 对照表（bot_dirs），不再报单一 dir
 // @意图#R639(2026-10-27): 没目录也能连上；目录由 createSession 管（网页上选完马上生效），重连时 hello 带当前目录
 // @意图#R636(2026-10-27): 前台运行、心跳、执行工具调用；断线时杀掉正在跑的命令，重连后不重放
@@ -411,6 +450,7 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
   const done = new Promise((r) => { resolveDone = r; });
   const finish = (why) => { if (!stopped) { stopped = true; } resolveDone(why); };
   const send = (sock, msg) => { if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(msg)); };
+  const browserInfo = () => { try { const b = browserStatus(); return { installed: b.installed, version: b.version }; } catch { return { installed: false, version: null }; } };
 
   function connect() {
     if (stopped) return;
@@ -418,8 +458,8 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
     ws = sock;
     sock.addEventListener("open", () => {
       send(sock, { type: "hello", version: PROTOCOL_VERSION, device_id: cfg.device_id, token: cfg.token, bot_dirs: session.botDirs,
-        name: cfg.name ?? os.hostname(), os: `${process.platform} ${os.release()}`, runner_version: RUNNER_VERSION, autostart: background });
-      beat = setInterval(() => send(sock, { type: "ping" }), HEARTBEAT_MS);
+        name: cfg.name ?? os.hostname(), os: `${process.platform} ${os.release()}`, runner_version: RUNNER_VERSION, autostart: background, browser: browserInfo() });
+      beat = setInterval(() => send(sock, { type: "ping", browser: browserInfo() }), HEARTBEAT_MS);
     });
     sock.addEventListener("message", (ev) => {
       let msg;
@@ -452,6 +492,7 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
     if (stopped) return;
     stopped = true;
     session.killAll();
+    void session.closeBrowsers(); // R729
     clearInterval(beat);
     try { ws?.close(1000, "runner stopped"); } catch { /* ignore */ }
     resolveDone("stopped");
@@ -575,9 +616,12 @@ const usage = (prog) => `用法：
   ${prog} set-dir <bot_id> <路径>   直接指定这个 bot 的授权目录（和网页上点「选择目录」走同一套检查；弹窗弹不出来时用）
   ${prog} autostart on|off|status   开机自启（Mac 用 launchd，Windows 用计划任务；on 也用来升级到新版本）
   ${prog} uninstall [--purge]       关掉自启、删掉本地副本和日志（--purge 连配置一起删）
+  ${prog} browser install    装 bot 专用的浏览器（playwright-core + 一只独立的 Chromium，约 200MB，先官方源、失败换国内镜像）
+  ${prog} browser status     看浏览器装没装
   ${prog} --version
 目录请连上后在网页上每个 bot 的私聊里点输入框下面「我的电脑」那一行选，Mac / Windows 上会弹窗让你选。`;
 
+// @意图#R729(2026-11-04): 新命令 browser install | status（装 bot 专用浏览器、看装没装）
 // @意图#R666(2026-10-29): pair 默认配完直接 start（--no-start 只配对）；配完按 decideAutostart 问 / 提示 / 开启开机自启，开了就不在前台跑；
 // 新命令 stop、autostart on|off|status、uninstall、--version；status 多显示在不在跑、版本、开机自启；用法里的命令按运行方式写（npx 时写 npx 写法）
 // @意图#R664(2026-10-29): 导出给 bin/agent-hub-runner.mjs 调；用法和「现在运行：… start」里的命令名用 progName（装好的 agent-hub-runner，仓库里 node 写法）
@@ -688,6 +732,19 @@ export async function main(argv, prog = progName(), deps = {}) {
     }
     console.log(`服务器：${cfg.server}\n设备：${cfg.device_id}\n运行器版本：${RUNNER_VERSION}\n现在：${run}${auto}\n各 bot 的授权目录：${d.length ? d.map(([b, p]) => `\n  ${b}：${p}`).join("") : "（还没有，连上后在每个 bot 的私聊里点「选择目录」）"}`);
     return;
+  }
+  // @意图#R729(2026-11-04): 乙：浏览器组件不进运行器的依赖，用户敲这一条才装（网页抽屉里给的就是它）；status 只看文件，不加载
+  if (a.cmd === "browser") {
+    const sub = a.positional[0] ?? "status";
+    if (sub === "install") { await (deps.installBrowser ?? installBrowser)({ log: (t) => console.log(t) }); return; }
+    if (sub === "status") {
+      const st = browserStatus();
+      console.log(st.installed ? `浏览器：装好了（playwright-core ${st.version}）`
+        : st.reason === "version_mismatch" ? `浏览器：版本不对（装的是 ${st.version}），重新运行 ${prog} browser install`
+          : `浏览器：还没装。运行 ${prog} browser install`);
+      return;
+    }
+    throw new Error(`browser 后面只能是 install 或 status（${sub} 不认识）`);
   }
   if (a.cmd === "version") { console.log(RUNNER_VERSION); return; }
   console.log(usage(prog));
