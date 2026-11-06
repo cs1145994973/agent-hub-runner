@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { editText } from "./edit.mjs";
+import { opContextSnapshot } from "./project-context.mjs";
 
 export const MAX_READ_BYTES = 20 * 1024 * 1024;
 /** bash 没给 timeout 时的默认上限（秒），到点杀掉整个进程组。 */
@@ -183,12 +184,15 @@ export function opBash(args, root, { onData, signal, platform = process.platform
 
 /** 按 op 分派；未知 op 拒绝。 */
 // @意图#R690(2026-11-01): write、edit 也收 extra（onChange 存改动记录）
-// @意图#R636(2026-10-27): 协议里只有这四种工具调用
+// @意图#R745(2026-11-06): 另加只读 context_snapshot（无路径入参）
+// @意图#R636(2026-10-27): 协议里原有四种工具调用
+// @意图#R745(2026-11-06): 从客户已授权目录加载项目规则并按需提供技能
 export function runOp(op, args, root, extra) {
   const a = args && typeof args === "object" ? args : {};
   if (op === "read") return opRead(a, root);
   if (op === "write") return opWrite(a, root, extra);
   if (op === "edit") return opEdit(a, root, extra);
   if (op === "bash") return opBash(a, root, extra);
+  if (op === "context_snapshot") return opContextSnapshot(a, root); // 固定扫授权根，忽略路径参数
   return Promise.reject(new Error(`未知操作 ${op}`));
 }

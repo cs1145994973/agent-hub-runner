@@ -1,3 +1,4 @@
+// @意图#R745(2026-11-06): 从客户已授权目录加载项目规则并按需提供技能
 // @意图#R729(2026-11-04): B5 版本 0.2.0、files 多 browser.mjs（浏览器组件不进依赖，dependencies 仍然没有）；B3 复制的源码也带上它
 // @意图#R722(2026-11-03): B5 版本跟着 package.json 改成 0.1.3（904c90c 发 0.1.3 时漏改，测试一直挂着）
 // @意图#R690(2026-11-01): B5 版本 0.1.2、files 多 changes.mjs；B 系列复制的源码也带上它
@@ -50,7 +51,7 @@ describe("R664 npm 小工具的运行方式", () => {
   it("B3 文件在 node_modules 里（Windows 的 .cmd 是直接 node 这个文件）：也写 agent-hub-runner；仓库里跑 bin 写 node 相对路径", async () => {
     const pkg = path.join(tmp, "lib", "node_modules", PKG_BIN);
     mkdirSync(path.join(pkg, "bin"), { recursive: true });
-    for (const f of ["runner.mjs", "ops.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "autostart.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f));
+    for (const f of ["runner.mjs", "ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "autostart.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f));
     cpSync(binFile, path.join(pkg, "bin", "agent-hub-runner.mjs"));
     const r = await run(process.execPath, [path.join(pkg, "bin", "agent-hub-runner.mjs")], { cwd: tmp });
     assert.ok(r.stdout.includes("agent-hub-runner pair <配对码>"), r.stdout);
@@ -80,10 +81,10 @@ describe("R664 npm 小工具的运行方式", () => {
     const p = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
     assert.equal(p.private, undefined);
     assert.equal(p.name, PKG_BIN);
-    assert.equal(p.version, "0.2.2");
+    assert.equal(p.version, "0.3.1");
     assert.equal(p.type, "module");
     assert.deepEqual(p.bin, { [PKG_BIN]: "bin/agent-hub-runner.mjs" });
-    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "ops.mjs", "runner.mjs"]);
+    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "ops.mjs", "project-context.mjs", "runner.mjs"]);
     assert.equal(p.engines.node, ">=22");
     assert.equal(p.dependencies, undefined);
   });
