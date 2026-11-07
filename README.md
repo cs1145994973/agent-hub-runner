@@ -57,7 +57,7 @@ npx -y agent-hub-runner@latest browser install # 给 bot 装它自己的浏览�
 npx -y agent-hub-runner@latest browser status  # 看浏览器装没装
 ```
 
-开机自启时，程序复制到 `~/.agent-runner/bin/<版本>/`，日志在 `~/.agent-runner/logs/runner.log`（超过 5MB 自动清空）。网页上提示「有新版本」时，按提示运行那一条升级命令。
+开机自启时，程序复制到 `~/.agent-runner/bin/<版本>/`，日志在 `~/.agent-runner/logs/runner.log`（超过 5MB 自动清空）。网页上提示「有新版本」时，0.3.2 起可以直接点「升级」；更早的版本按提示运行那一条升级命令。
 
 仓库开发者（R699）：要让仓库里的源码 `runner/runner.mjs` 直接连测试服、开机自启，用 `agent-hub/scripts/runner-test.sh autostart on|off | start | stop | status | log`（launchd 服务 `com.agenthub.runner.src`，日志 `~/.agent-runner/logs/runner-src.log`，不复制程序，改了代码 `start` 一下就生效）。普通用户不用管这个。
 
