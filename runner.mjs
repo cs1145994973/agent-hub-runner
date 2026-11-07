@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import { runOp } from "./ops.mjs";
 import { buildChangeRecord, changesDirFor, CHANGE_ID_RE, createChangeStore } from "./changes.mjs";
 import { browserStatus, createBrowserManager, installBrowser } from "./browser.mjs";
+import { searchWeb, cleanSearchConfig, searchConfigStatus } from "./search.mjs"; // R751
 import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, COPY_FILES, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
 export const PROTOCOL_VERSION = 1;
@@ -306,7 +307,8 @@ const wsUrlOf = (server) => `${server.replace(/^http/, "ws")}/devices/ws`;
 // 新消息 change_get {id, change_id} → change_result {id, ok:true, found, record}，不看这个 bot 有没有目录（换了目录也能看旧记录）
 // @意图#R729(2026-11-04): 新消息 browser {id, bot_id, action, args} → result（截图或元素清单）、browser_open {id, bot_id} → result（网页点「打开 bot 的浏览器」）；
 // 浏览器不看这个 bot 有没有选目录（资料目录在 ~/.agent-runner/browser-profiles/<bot_id>/，和授权目录无关）；断线不关浏览器（重连后接着用）
-export function createSession(cfg, { log = say, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), changes, browser } = {}) {
+export function createSession(cfg, { log = say, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), changes, browser, search } = {}) {
+  const searchImpl = search ?? searchWeb; // R751：测试注入，默认真搜
   let dirs = botDirsOf(cfg); // bot_id → 授权目录
   let browsers = browser; // R729：每个 bot 一只浏览器，用到时才建
   const browserMgr = () => (browsers ??= createBrowserManager({ log }));
@@ -362,6 +364,32 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       send({ type: "result", id, ok: false, error: e?.message ?? String(e) });
     }
   }
+  // @意图#R751(2026-11-07): 联网搜索：不看 bot 有没有选目录（搜索不碰文件）；按本机配置选 provider，key 只在这台电脑上
+  async function handleSearch(send, msg) {
+    const { id } = msg;
+    const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
+    const query = typeof msg.args?.query === "string" ? msg.args.query : "";
+    log(`[${bot}] 搜索：${query}`);
+    try {
+      const r = await searchImpl(query, { count: msg.args?.count, search: cfg.search });
+      send({ type: "result", id, ok: true, provider: r.provider, results: r.results, cached: r.cached === true });
+    } catch (e) {
+      send({ type: "result", id, ok: false, error: e?.message ?? String(e) });
+    }
+  }
+  // 网页保存搜索配置：key 只写本机配置文件，不回显；服务器只拿 provider/hasKey 状态
+  async function handleSearchConfig(send, msg) {
+    const { id } = msg;
+    try {
+      cfg.search = cleanSearchConfig(msg.config);
+      saveConfig(cfg, file);
+      log(`搜索配置已保存：${cfg.search.provider}${cfg.search.apiKey ? "（有 key）" : ""}`);
+      send({ type: "result", id, ok: true, ...searchConfigStatus(cfg.search) });
+    } catch (e) {
+      send({ type: "result", id, ok: false, error: e?.message ?? String(e) });
+    }
+  }
+
   // @意图#R729(2026-11-04): 网页点「打开 bot 的浏览器」：在这台电脑上弹出有窗口的浏览器（后台的换成有窗口的，恢复打开的网址）
   async function handleBrowserOpen(send, msg) {
     const { id } = msg;
@@ -412,6 +440,8 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       if (msg.type === "change_get") return handleChangeGet(send, msg);
       if (msg.type === "browser") return handleBrowser(send, msg); // R729
       if (msg.type === "browser_open") return handleBrowserOpen(send, msg); // R729
+      if (msg.type === "search") return handleSearch(send, msg); // R751
+      if (msg.type === "search_config") return handleSearchConfig(send, msg); // R751
       if (msg.type === "abort") { jobs.get(msg.id)?.abort(); picks.get(msg.id)?.abort(); }
       return undefined;
     },
@@ -462,7 +492,7 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
     ws = sock;
     sock.addEventListener("open", () => {
       send(sock, { type: "hello", version: PROTOCOL_VERSION, device_id: cfg.device_id, token: cfg.token, bot_dirs: session.botDirs,
-        name: cfg.name ?? os.hostname(), os: `${process.platform} ${os.release()}`, runner_version: RUNNER_VERSION, autostart: background, browser: browserInfo() });
+        name: cfg.name ?? os.hostname(), os: `${process.platform} ${os.release()}`, runner_version: RUNNER_VERSION, autostart: background, browser: browserInfo(), search: searchConfigStatus(cfg.search) });
       beat = setInterval(() => send(sock, { type: "ping", browser: browserInfo() }), HEARTBEAT_MS);
     });
     sock.addEventListener("message", (ev) => {
