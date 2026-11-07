@@ -81,7 +81,7 @@ describe("R664 npm 小工具的运行方式", () => {
     const p = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
     assert.equal(p.private, undefined);
     assert.equal(p.name, PKG_BIN);
-    assert.equal(p.version, "0.3.1");
+    assert.equal(p.version, "0.3.2");
     assert.equal(p.type, "module");
     assert.deepEqual(p.bin, { [PKG_BIN]: "bin/agent-hub-runner.mjs" });
     assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "ops.mjs", "project-context.mjs", "runner.mjs"]);

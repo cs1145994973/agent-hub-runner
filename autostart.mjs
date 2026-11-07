@@ -116,6 +116,17 @@ export function installCopy({ srcDir, version, env = process.env, platform = pro
   return path.join(cur, "runner.mjs");
 }
 
+/**
+ * R750：校验 npm 包的 integrity。npm 给的是 "sha512-<base64>"，对不上返回 false，调用方不得替换正在跑的版本。
+ * 只认 sha512。别的算法（sha1、没有 integrity）一律 false，不将就。
+ */
+export function integrityOk(buf, integrity) {
+  const m = /^sha512-(.+)$/.exec(String(integrity ?? "").trim());
+  if (!m) return false;
+  const got = createHash("sha512").update(buf).digest("base64");
+  return got === m[1];
+}
+
 /** 默认的 launchctl：返回 { code, stdout, stderr }，不抛错。AGENT_RUNNER_LAUNCHCTL 可换成别的程序（测试用假的，不真加载） */
 export function runLaunchctl(args, env = process.env) {
   return new Promise((resolve) => {

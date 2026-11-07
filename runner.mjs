@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 import { runOp } from "./ops.mjs";
 import { buildChangeRecord, changesDirFor, CHANGE_ID_RE, createChangeStore } from "./changes.mjs";
 import { browserStatus, createBrowserManager, installBrowser } from "./browser.mjs";
-import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
+import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, COPY_FILES, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
 export const PROTOCOL_VERSION = 1;
 /** npm 包名，也是装好后的命令名 */
@@ -438,7 +438,7 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
 // @意图#R640(2026-10-27): hello 报 bot→目录 对照表（bot_dirs），不再报单一 dir
 // @意图#R639(2026-10-27): 没目录也能连上；目录由 createSession 管（网页上选完马上生效），重连时 hello 带当前目录
 // @意图#R636(2026-10-27): 前台运行、心跳、执行工具调用；断线时杀掉正在跑的命令，重连后不重放
-export function startRunner(cfg, { log = say, retryMs = 2000, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), background = process.env.AGENT_RUNNER_LAUNCHD === "1" } = {}) {
+export function startRunner(cfg, { log = say, retryMs = 2000, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), background = process.env.AGENT_RUNNER_LAUNCHD === "1", selfUpdate: selfUpdateFn } = {}) {
   checkNode();
   let fails = 0;
   const session = createSession(cfg, { log, pickDir, platform, file });
@@ -446,12 +446,16 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
   let ws = null;
   let stopped = false;
   let beat = null;
+  let retry = null;
   let resolveDone;
   const done = new Promise((r) => { resolveDone = r; });
   const finish = (why) => { if (!stopped) { stopped = true; } resolveDone(why); };
   const send = (sock, msg) => { if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(msg)); };
   const browserInfo = () => { try { const b = browserStatus(); return { installed: b.installed, version: b.version }; } catch { return { installed: false, version: null }; } };
 
+  // @意图#R750(2026-11-07): 网页点「升级」发来 self_update（不带参数）。自己查最新版、校验、换上、拉起新版，回一条结果后正常退出，
+  //   让新版接上。失败了回原因，旧版继续跑。同时只跑一个，重复发来的忽略。
+  let updating = false;
   function connect() {
     if (stopped) return;
     const sock = new WebSocket(wsUrlOf(cfg.server));
@@ -471,6 +475,7 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
         log(n ? `已连上服务器 ${cfg.server}，${n} 个 bot 选了目录。${tail}`
           : `已连上服务器 ${cfg.server}，还没有 bot 选目录：请在网页上每个 bot 的私聊里点输入框下面「我的电脑」那一行，再点「选择目录」。${tail}`);
       } else if (msg.type === "revoked") { session.killAll(); log("网页上已断开这台电脑，令牌已作废。要再连，请在网页上重新拿配对码配对。"); }
+      else if (msg.type === "self_update") { void runSelfUpdate(sock); }
       else void session.onMessage(msg, (m) => send(sock, m));
     });
     sock.addEventListener("close", (ev) => {
@@ -494,6 +499,7 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
     session.killAll();
     void session.closeBrowsers(); // R729
     clearInterval(beat);
+    clearTimeout(retry);
     try { ws?.close(1000, "runner stopped"); } catch { /* ignore */ }
     resolveDone("stopped");
   };
@@ -620,6 +626,90 @@ export async function waitNewHolder(file, { version = RUNNER_VERSION, ms = 10000
     if (t >= ms) return null;
     await sleep(step);
   }
+}
+
+/**
+ * R750：自己升级。版本号自己去 npm 查，不接收调用方给的版本或命令。
+ * 下载的包按 integrity 校验 sha512，对不上就不替换。
+ * fetchLatest / download / extract / spawnNext 都可以换成假的（测试用），默认走真的 npm。
+ * 返回 { ok:true, version } 或 { ok:false, error }。成功时新进程已经拉起，调用方负责退出自己。
+ */
+// @意图#R750(2026-11-07): 网页点「升级」，运行器自己拉最新版换上，用户不用开终端。指令不带参数，目标版本自己查，
+//   校验不过就不动旧版。没开开机自启的也拉一个后台新进程接上，不用先 Ctrl-C。
+export const NPM_PACK_URL = (version) => `https://registry.npmjs.org/agent-hub-runner/-/agent-hub-runner-${version}.tgz`;
+export async function fetchLatestPack(fetchImpl = globalThis.fetch, timeoutMs = 8000) {
+  const r = await fetchImpl("https://registry.npmjs.org/agent-hub-runner/latest", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(timeoutMs) });
+  if (!r.ok) return null;
+  const b = await r.json().catch(() => null);
+  const version = typeof b?.version === "string" ? b.version : "";
+  const integrity = typeof b?.dist?.integrity === "string" ? b.dist.integrity : "";
+  if (!/^\d+\.\d+\.\d+/.test(version) || !integrity.startsWith("sha512-")) return null;
+  return { version, integrity, tarball: typeof b?.dist?.tarball === "string" ? b.dist.tarball : NPM_PACK_URL(version) };
+}
+/** 下载 tgz。地址只接受 registry.npmjs.org，别的一律拒绝，不跟随调用方给的地址。 */
+export async function downloadPack(latest, fetchImpl = globalThis.fetch, timeoutMs = 20000) {
+  const url = new URL(latest.tarball);
+  if (url.protocol !== "https:" || url.hostname !== "registry.npmjs.org") throw new Error("只从 registry.npmjs.org 下载");
+  const r = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!r.ok) throw new Error(`下载失败 ${r.status}`);
+  return Buffer.from(await r.arrayBuffer());
+}
+/** 解压 tgz 到临时目录，返回 package/ 子目录（npm 包的根）。只取运行器自己那几份文件，不执行包里的任何东西。 */
+export async function extractPack(buf) {
+  const { mkdtempSync } = await import("node:fs");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "agent-runner-upd-"));
+  const tar = spawn("tar", ["-xzf", "-", "-C", dir], { stdio: ["pipe", "ignore", "ignore"] });
+  const done = new Promise((resolve, reject) => { tar.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`解压失败 ${code}`))); tar.on("error", reject); });
+  tar.stdin.end(buf);
+  await done;
+  const pkg = path.join(dir, "package");
+  const { readdirSync } = await import("node:fs");
+  for (const name of readdirSync(pkg)) if (!COPY_FILES.includes(name)) rmSync(path.join(pkg, name), { recursive: true, force: true });
+  return pkg;
+}
+/**
+ * 拉起新版后台进程。新版从刚装好的副本起，不从下载的临时目录起。
+ * 开机自启的交给 launchd / 计划任务重新加载（新版按 R732 顶掉旧的）；没开的自己起一个后台进程，等它拿到锁。
+ */
+export async function spawnUpdated({ version, file, env = process.env, platform = process.platform, launchctl, schtasks, spawnFn = spawn, wait = waitNewHolder }) {
+  const script = path.join(runnerHome(env), "bin", version, "runner.mjs");
+  if (platform === "win32" && env.AGENT_RUNNER_LAUNCHD === "1") {
+    await autostartOnWindows({ configFile: file, version, srcDir: path.dirname(script), execPath: process.execPath, env, schtasks });
+  } else if (platform === "darwin" && env.AGENT_RUNNER_LAUNCHD === "1") {
+    await autostartOn({ configFile: file, version, srcDir: path.dirname(script), execPath: process.execPath, env, launchctl, platform });
+  } else {
+    const child = spawnFn(process.execPath, [script, "start"], { detached: true, stdio: "ignore", env: { ...env, AGENT_RUNNER_LAUNCHD: "" } });
+    child.unref();
+  }
+  const got = await wait(file, { version });
+  if (!got) throw new Error("新版没有接上");
+  return got;
+}
+/**
+ * R750：处理一条 self_update。不看消息内容（版本号、命令都忽略），只跑 selfUpdate。
+ * 回一条 self_update_result。成功返回 true，调用方退出让新版接上；失败返回 false，旧版继续跑。
+ */
+export async function handleSelfUpdate({ file, platform, selfUpdate: run = selfUpdate, log = () => {} }, send) {
+  const r = await run({ file, env: process.env, platform }).catch((e) => ({ ok: false, error: e?.message ?? String(e) }));
+  send({ type: "self_update_result", ok: r.ok === true, ...(r.ok ? { version: r.version } : { error: r.error ?? "升级失败" }) });
+  if (r.ok) { log(`已换到 ${r.version}，这个进程退出，新版接上`); return true; }
+  log(`升级没成：${r.error}`);
+  return false;
+}
+export async function selfUpdate({ file = configPath(), env = process.env, platform = process.platform, fetchLatest = () => fetchLatestPack(), download = downloadPack, extract = extractPack, spawnNext = spawnUpdated, currentVersion = RUNNER_VERSION } = {}) {
+  const latest = await fetchLatest().catch(() => null);
+  if (!latest) return { ok: false, error: "查不到最新版，没有更换" };
+  if (!newerVersion(latest.version, currentVersion)) return { ok: false, error: `已经是最新版（${currentVersion}）` };
+  const buf = await download(latest).catch(() => null);
+  if (!buf) return { ok: false, error: "下载失败，没有更换" };
+  if (!integrityOk(buf, latest.integrity)) return { ok: false, error: "下载的包校验对不上，没有更换" };
+  let srcDir;
+  try { srcDir = await extract(buf, latest.version); } catch (e) { return { ok: false, error: `解压失败，没有更换：${e?.message ?? e}` }; }
+  installCopy({ srcDir, version: latest.version, env, platform });
+  try {
+    await spawnNext({ version: latest.version, file, env });
+  } catch (e) { return { ok: false, error: `新版没接上，没有换掉正在跑的：${e?.message ?? e}` }; }
+  return { ok: true, version: latest.version };
 }
 
 const here = () => path.dirname(fileURLToPath(import.meta.url));
