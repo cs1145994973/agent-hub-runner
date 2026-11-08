@@ -1,6 +1,6 @@
 {
   "name": "agent-hub-runner",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "agent-hub 的电脑运行器：配对后让你的 bot 在这台电脑上读写授权目录里的文件、跑命令（跑命令要你在网页上批准），还能用它自己的独立浏览器",
   "type": "module",
   "bin": {

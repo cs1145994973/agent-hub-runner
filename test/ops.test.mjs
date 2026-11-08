@@ -1,4 +1,5 @@
-// @意图#R636(2026-10-27): 运行器单测：目录外绝对路径、../、越界符号链接（含悬空的）都拒绝；目录内正常读写、改、跑命令；超时和中止杀进程。
+// @意图#R636(2026-10-27): 运行器单测：路径解析、读写改、跑命令、超时和中止杀进程。
+// @意图#R758(2026-11-08): 工作目录只是默认 cwd；绝对路径、../、~ 和指向目录外的符号链接都允许访问（整台电脑）。
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import os from "node:os";
@@ -27,26 +28,27 @@ before(() => {
 after(() => rmSync(base, { recursive: true, force: true }));
 
 describe("R636 运行器：路径", () => {
-  it("R1 目录外绝对路径拒绝", async () => {
-    await assert.rejects(opRead({ path: path.join(outside, "secret.txt") }, root), /目录外路径已拒绝/);
-    await assert.rejects(opWrite({ path: path.join(outside, "x.txt"), content: "x" }, root), /目录外路径已拒绝/);
-    assert.equal(existsSync(path.join(outside, "x.txt")), false);
+  it("R1 默认目录外绝对路径可读写", async () => {
+    assert.equal((await opRead({ path: path.join(outside, "secret.txt") }, root)).text, "秘密");
+    await opWrite({ path: path.join(outside, "x.txt"), content: "x" }, root);
+    assert.equal(readFileSync(path.join(outside, "x.txt"), "utf8"), "x");
   });
-  it("R2 ../ 拒绝", async () => {
-    await assert.rejects(opRead({ path: "../outside/secret.txt" }, root), /目录外路径已拒绝/);
-    await assert.rejects(opEdit({ path: "sub/../../outside/secret.txt", edits: [{ oldText: "秘密", newText: "x" }] }, root), /目录外路径已拒绝/);
-    assert.equal(readFileSync(path.join(outside, "secret.txt"), "utf8"), "秘密");
+  it("R2 ../ 可读写", async () => {
+    assert.equal((await opRead({ path: "../outside/secret.txt" }, root)).text, "秘密");
+    writeFileSync(path.join(outside, "edit.txt"), "秘密");
+    await opEdit({ path: "sub/../../outside/edit.txt", edits: [{ oldText: "秘密", newText: "x" }] }, root);
+    assert.equal(readFileSync(path.join(outside, "edit.txt"), "utf8"), "x");
   });
-  it("R3 越界符号链接拒绝（文件、目录、悬空的）", async () => {
-    await assert.rejects(opRead({ path: "link-out" }, root), /目录外路径已拒绝/);
-    await assert.rejects(opRead({ path: "dir-out/secret.txt" }, root), /目录外路径已拒绝/);
-    await assert.rejects(opWrite({ path: "dangling-out", content: "x" }, root), /目录外路径已拒绝/);
-    await assert.rejects(opWrite({ path: "dir-out/new.txt", content: "x" }, root), /目录外路径已拒绝/);
-    assert.equal(existsSync(path.join(outside, "nope.txt")), false);
-    assert.equal(existsSync(path.join(outside, "new.txt")), false);
+  it("R3 指向默认目录外的符号链接也可访问（文件、目录、悬空的）", async () => {
+    assert.equal((await opRead({ path: "link-out" }, root)).text, "秘密");
+    assert.equal((await opRead({ path: "dir-out/secret.txt" }, root)).text, "秘密");
+    await opWrite({ path: "dangling-out", content: "x" }, root);
+    await opWrite({ path: "dir-out/new.txt", content: "x" }, root);
+    assert.equal(readFileSync(path.join(outside, "nope.txt"), "utf8"), "x");
+    assert.equal(readFileSync(path.join(outside, "new.txt"), "utf8"), "x");
   });
-  it("R4 ~ 指家目录，不在授权目录里就拒绝", async () => {
-    await assert.rejects(resolveInside("~/.ssh/id_rsa", root), /目录外路径已拒绝/);
+  it("R4 ~ 指家目录，可解析到真实路径", async () => {
+    assert.equal(await resolveInside("~", root), os.homedir());
   });
   it("R5 目录内正常读、写（含新建上级目录）、目录内符号链接可读", async () => {
     const r = await opRead({ path: "a.txt" }, root);

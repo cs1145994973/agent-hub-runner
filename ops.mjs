@@ -1,5 +1,5 @@
-// @意图#R636(2026-10-27): 运行器在你电脑上真正执行 read / write / edit / bash。路径只在这里判断（S6 结论：服务器不解析用户电脑的路径）：
-// 先按授权目录换算成真实路径（解开符号链接，包括指向不存在目标的符号链接），不在授权目录里的一律拒绝；bash 的工作目录就是授权目录。
+// @意图#R636(2026-10-27): 运行器在你电脑上真正执行 read / write / edit / bash。路径只在这里判断（S6 结论：服务器不解析用户电脑的路径）。
+// @意图#R758(2026-11-08): 绑定后整台电脑都可读写，工作目录只是默认 cwd（相对路径起点）；仍然解开符号链接，不越过 OS 账号权限。
 // 第一轮没有沙箱（king 定的范围）：bash 里的命令本身能碰到目录外的东西，只能靠你看清批准卡片再点。
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
@@ -44,14 +44,10 @@ export async function realOf(abs, depth = 0) {
 
 export const inside = (real, root) => real === root || real.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
 
-/** 换算并检查：在授权目录里返回真实路径，不在就抛「目录外路径已拒绝」。 */
-// @意图#R636(2026-10-27): 授权目录外的路径一律拒绝
+/** 换算成真实路径；R758 起不再限制在 root 内，root 只用来解析相对路径。 */
 export async function resolveInside(p, root) {
   if (typeof p !== "string" || !p.trim()) throw new Error("路径是空的");
-  let real;
-  try { real = await realOf(expandPath(p, root)); } catch (e) { throw new Error(`无法解析路径：${p}（${e?.code ?? e?.message ?? e}）`); }
-  if (!inside(real, root)) throw new Error(`目录外路径已拒绝：${p}（授权目录是 ${root}）`);
-  return real;
+  try { return await realOf(expandPath(p, root)); } catch (e) { throw new Error(`无法解析路径：${p}（${e?.code ?? e?.message ?? e}）`); }
 }
 
 function imageMime(buf) {

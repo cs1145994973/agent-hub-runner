@@ -1,5 +1,5 @@
-// @意图#R640(2026-10-27): 每个 bot 一个授权目录（弹窗函数注入，不真弹）：pick_dir 带 bot_id，选完记进对照表、写回配置（600）；调用按 bot_id 查目录，
-// A 只能动 A 的、B 只能动 B 的；没条目的 bot 被拒；换 A 不影响 B；老格式配置的单一 dir 忽略；取消、根目录、非 Mac、超时中止
+// @意图#R640(2026-10-27): 每个 bot 一个默认工作目录（弹窗函数注入，不真弹）：pick_dir 带 bot_id，选完记进对照表、写回配置（600）；调用按 bot_id 查目录；
+// @意图#R758(2026-11-08): 工作目录只做默认 cwd，不再限制跨 bot/跨目录访问；没条目的 bot 仍被拒；换 A 不影响 B；老格式单一 dir 忽略；取消、非 Mac、超时中止
 // @意图#R639(2026-10-27已废弃): 网页叫运行器弹窗选目录：选完写回配置、之后只认新目录；取消、根目录、非 Mac、超时中止；没目录时调用一律拒绝（R640 改成按 bot 分）
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -24,7 +24,7 @@ describe("R640 每个 bot 自己的目录", () => {
   const picks = (...ds) => { let i = 0; return async () => ds[i++]; };
   const read = async (s, bot, p) => { const c = collect(); await s.onMessage({ type: "call", id: "c", op: "read", args: { path: p }, bot_id: bot }, c.send); return c.out.at(-1); };
 
-  it("S1 A、B 各选目录：dir_result 带 bot_id、对照表写回配置（600）；A 只能动 A 的、B 只能动 B 的；没条目的 C 被拒", async () => {
+  it("S1 A、B 各选目录：dir_result 带 bot_id、对照表写回配置（600）；相对路径各用各的，跨目录访问允许；没条目的 C 被拒", async () => {
     const a = mk("a1", "A 的文件"); const b = mk("b1", "B 的文件");
     const { file, cfg } = newCfg("s1");
     const s = createSession(cfg, { log: quiet, platform: "darwin", file, pickDir: picks(`${a}/`, b) });
@@ -42,14 +42,13 @@ describe("R640 每个 bot 自己的目录", () => {
     assert.equal(statSync(file).mode & 0o777, 0o600);
     assert.equal((await read(s, "bot-a", "f.txt")).text, "A 的文件");
     assert.equal((await read(s, "bot-b", "f.txt")).text, "B 的文件");
-    for (const [bot, p] of [["bot-a", path.join(b, "f.txt")], ["bot-a", "../b1/f.txt"], ["bot-b", path.join(a, "f.txt")]]) {
-      const r = await read(s, bot, p);
-      assert.equal(r.ok, false);
-      assert.match(r.error, /目录外路径已拒绝/);
-    }
+    assert.equal((await read(s, "bot-a", path.join(b, "f.txt"))).text, "B 的文件");
+    assert.equal((await read(s, "bot-a", "../b1/f.txt")).text, "B 的文件");
+    assert.equal((await read(s, "bot-b", path.join(a, "f.txt"))).text, "A 的文件");
     const w = collect();
     await s.onMessage({ type: "call", id: "w", op: "write", args: { path: path.join(b, "x.txt"), content: "x" }, bot_id: "bot-a" }, w.send);
-    assert.match(w.out.at(-1).error, /目录外路径已拒绝/);
+    assert.equal(w.out.at(-1).ok, true);
+    assert.equal(readFileSync(path.join(b, "x.txt"), "utf8"), "x");
     for (const bot of ["bot-c", undefined]) {
       const c2 = collect();
       for (const op of ["read", "write", "edit", "bash"]) await s.onMessage({ type: "call", id: op, op, args: { path: "f.txt", command: "ls", content: "x", edits: [] }, bot_id: bot }, c2.send);
@@ -83,19 +82,19 @@ describe("R640 每个 bot 自己的目录", () => {
     assert.deepEqual(botDirsOf({ bot_dirs: { x: 1, y: "", z: "/tmp" } }), { z: "/tmp" }); // 坏条目不认
   });
 
-  it("S4 点了取消：回 cancelled（带 bot_id），对照表和配置都不变；选了根目录：拒绝；非 Mac：回「只支持 Mac」不弹窗；缺 bot_id：拒绝不弹窗", async () => {
+  it("S4 点了取消：回 cancelled（带 bot_id），对照表和配置都不变；选了不存在的目录：拒绝；非 Mac：回「只支持 Mac」不弹窗；缺 bot_id：拒绝不弹窗", async () => {
     const a = mk("a4", "A");
     const { file, cfg } = newCfg("s4", { bot_dirs: { "bot-a": a } });
     const before = readFileSync(file, "utf8");
     let asked = 0;
-    const s = createSession(cfg, { log: quiet, platform: "darwin", file, pickDir: async () => { asked++; return asked === 1 ? null : "/"; } });
+    const s = createSession(cfg, { log: quiet, platform: "darwin", file, pickDir: async () => { asked++; return asked === 1 ? null : path.join(base, "no-such-dir"); } });
     const c = collect();
     await s.onMessage({ type: "pick_dir", id: "p1", bot_id: "bot-a" }, c.send);
     await s.onMessage({ type: "pick_dir", id: "p2", bot_id: "bot-a" }, c.send);
     await s.onMessage({ type: "pick_dir", id: "p3" }, c.send);
     assert.deepEqual(c.out[0], { type: "dir_result", id: "p1", ok: false, bot_id: "bot-a", cancelled: true });
     assert.equal(c.out[1].ok, false);
-    assert.match(c.out[1].error, /根目录/);
+    assert.match(c.out[1].error, /工作目录不存在/);
     assert.deepEqual(c.out[2], { type: "dir_result", id: "p3", ok: false, error: "缺 bot_id" });
     assert.equal(asked, 2);
     assert.deepEqual(s.botDirs, { "bot-a": a });
@@ -106,6 +105,31 @@ describe("R640 每个 bot 自己的目录", () => {
     await lin.onMessage({ type: "pick_dir", id: "p4", bot_id: "bot-a" }, c2.send);
     assert.deepEqual(c2.out, [{ type: "dir_result", id: "p4", ok: false, bot_id: "bot-a", error: PICK_ONLY_MAC }]);
     assert.equal(linAsked, 0);
+  });
+
+  it("S8 R758：set_binding 空目录用固定共享资料库；自定义目录照写；调用带的冻结目录优先于当前目录", async () => {
+    const a = mk("s8-a", "A 的文件"); const b = mk("s8-b", "B 的文件");
+    const oldHome = process.env.AGENT_RUNNER_HOME;
+    process.env.AGENT_RUNNER_HOME = path.join(base, "s8-home");
+    try {
+      const { file, cfg } = newCfg("s8");
+      const s = createSession(cfg, { log: quiet, platform: "darwin", file });
+      const c = collect();
+      await s.onMessage({ type: "set_binding", id: "b1", bot_id: "bot-a", dir: null }, c.send);
+      const lib = path.join(base, "s8-home", "library");
+      assert.equal(c.out.at(-1).ok, true);
+      assert.equal(c.out.at(-1).dir, lib);
+      assert.equal(statSync(lib).isDirectory(), true);
+      assert.deepEqual(botDirsOf(JSON.parse(readFileSync(file, "utf8"))), { "bot-a": lib });
+      await s.onMessage({ type: "set_binding", id: "b2", bot_id: "bot-b", dir: b }, c.send);
+      assert.deepEqual(s.botDirs, { "bot-a": lib, "bot-b": b });
+      // 当前 bot-a 在资料库；调用显式带 A 的冻结目录，就用 A 的文件。
+      const frozen = collect();
+      await s.onMessage({ type: "call", id: "f1", op: "read", args: { path: "f.txt" }, bot_id: "bot-a", dir: a }, frozen.send);
+      assert.equal(frozen.out.at(-1).text, "A 的文件");
+    } finally {
+      if (oldHome === undefined) delete process.env.AGENT_RUNNER_HOME; else process.env.AGENT_RUNNER_HOME = oldHome;
+    }
   });
 
   it("S5 服务器超时发 abort：弹窗被中止（窗口进程关掉），不回 dir_result，配置不变", async () => {

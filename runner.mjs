@@ -31,7 +31,7 @@ import { browserStatus, createBrowserManager, installBrowser } from "./browser.m
 import { searchWeb, cleanSearchConfig, searchConfigStatus } from "./search.mjs"; // R751
 import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, COPY_FILES, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 /** npm 包名，也是装好后的命令名 */
 export const PKG_BIN = "agent-hub-runner";
 /** R666：抽屉里给的、npx 运行时提示里写的命令前缀（@latest：每次都用最新版，也不会被电脑上旧的全局安装盖掉） */
@@ -50,6 +50,8 @@ export const CLOSE_REPLACED = 4409;
 
 // @意图#R666(2026-10-29): 默认目录可用 AGENT_RUNNER_HOME 换（测试、开机自启的副本用）；不设时和原来一样是 ~/.agent-runner/config.json
 export const configPath = () => process.env.AGENT_RUNNER_CONFIG || path.join(runnerHome(), "config.json");
+/** R758：这台电脑固定的共享资料库（程序自己管理，不提供修改入口）；测试可用 AGENT_RUNNER_HOME 隔离。 */
+export const libraryDir = (env = process.env) => path.join(runnerHome(env), "library");
 
 const stamp = () => new Date().toLocaleTimeString("zh-CN", { hour12: false });
 const say = (s) => console.log(`[${stamp()}] ${s}`);
@@ -188,9 +190,8 @@ export function pickDirWindows({ signal, spawn: spawnFn = spawn } = {}) {
 
 // @意图#R639(2026-10-27): 配对时的 --dir 和网页上选的目录走同一套检查
 export async function checkDir(dir) {
-  const real = await fs.realpath(path.resolve(dir)).catch(() => { throw new Error(`授权目录不存在：${dir}`); });
-  if (!statSync(real).isDirectory()) throw new Error(`授权目录不是目录：${dir}`);
-  if (real === path.parse(real).root) throw new Error("不能把整个磁盘根目录授权出去");
+  const real = await fs.realpath(path.resolve(dir)).catch(() => { throw new Error(`工作目录不存在：${dir}`); });
+  if (!statSync(real).isDirectory()) throw new Error(`工作目录不是目录：${dir}`);
   return real;
 }
 
@@ -309,7 +310,8 @@ const wsUrlOf = (server) => `${server.replace(/^http/, "ws")}/devices/ws`;
 // 浏览器不看这个 bot 有没有选目录（资料目录在 ~/.agent-runner/browser-profiles/<bot_id>/，和授权目录无关）；断线不关浏览器（重连后接着用）
 export function createSession(cfg, { log = say, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), changes, browser, search } = {}) {
   const searchImpl = search ?? searchWeb; // R751：测试注入，默认真搜
-  let dirs = botDirsOf(cfg); // bot_id → 授权目录
+  const sharedLibrary = libraryDir();
+  let dirs = botDirsOf(cfg); // bot_id → 工作目录
   let browsers = browser; // R729：每个 bot 一只浏览器，用到时才建
   const browserMgr = () => (browsers ??= createBrowserManager({ log }));
   const jobs = new Map(); // 调用 id → AbortController
@@ -332,8 +334,11 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
   async function handleCall(send, msg) {
     const { id, op, args } = msg;
     const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
-    const dir = bot ? dirs[bot] : undefined; // 这次调用用开始时这个 bot 的目录；中途换目录不影响它
+    // R758：任务/这一轮冻结的目录优先；没有就按 bot 当前目录。中途换目录不影响已经发出去的调用。
+    const frozen = typeof msg.dir === "string" && msg.dir.trim() ? msg.dir.trim() : undefined;
+    let dir = bot ? (frozen ?? dirs[bot]) : undefined;
     if (!dir) { send({ type: "result", id, ok: false, error: NO_DIR }); return; }
+    try { dir = await checkDir(dir); } catch (e) { send({ type: "result", id, ok: false, error: e?.message ?? String(e) }); return; }
     const ac = new AbortController();
     jobs.set(id, ac);
     log(`[${bot}] ${op === "bash" ? `bash：${args?.command}` : `${op}：${args?.path}`}`);
@@ -403,6 +408,24 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     }
   }
 
+  // R758：服务器同步 bot 当前绑定。dir 空 = 用固定共享资料库；自定义路径来自本机选目录或服务器已保存的值。
+  async function handleSetBinding(send, msg) {
+    const { id } = msg;
+    const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
+    if (!bot) { send({ type: "result", id, ok: false, error: "缺 bot_id" }); return; }
+    try {
+      const wanted = typeof msg.dir === "string" && msg.dir.trim() ? msg.dir.trim() : sharedLibrary;
+      if (wanted === sharedLibrary) mkdirSync(sharedLibrary, { recursive: true, mode: 0o700 });
+      const real = await checkDir(wanted);
+      dirs = { ...dirs, [bot]: real };
+      cfg.bot_dirs = { ...dirs };
+      saveConfig(cfg, file);
+      send({ type: "result", id, ok: true, bot_id: bot, dir: real });
+    } catch (e) {
+      send({ type: "result", id, ok: false, error: e?.message ?? String(e) });
+    }
+  }
+
   async function handlePick(send, msg) {
     const { id } = msg;
     const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
@@ -436,6 +459,7 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     cleanChanges() { return changeStore().clean(true).catch(() => 0); },
     onMessage(msg, send) {
       if (msg.type === "call") return handleCall(send, msg);
+      if (msg.type === "set_binding") return handleSetBinding(send, msg);
       if (msg.type === "pick_dir") return handlePick(send, msg);
       if (msg.type === "change_get") return handleChangeGet(send, msg);
       if (msg.type === "browser") return handleBrowser(send, msg); // R729
@@ -491,7 +515,7 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
     const sock = new WebSocket(wsUrlOf(cfg.server));
     ws = sock;
     sock.addEventListener("open", () => {
-      send(sock, { type: "hello", version: PROTOCOL_VERSION, device_id: cfg.device_id, token: cfg.token, bot_dirs: session.botDirs,
+      send(sock, { type: "hello", version: PROTOCOL_VERSION, device_id: cfg.device_id, token: cfg.token, bot_dirs: session.botDirs, library_dir: libraryDir(),
         name: cfg.name ?? os.hostname(), os: `${process.platform} ${os.release()}`, runner_version: RUNNER_VERSION, autostart: background, browser: browserInfo(), search: searchConfigStatus(cfg.search) });
       beat = setInterval(() => send(sock, { type: "ping", browser: browserInfo() }), HEARTBEAT_MS);
     });

@@ -46,10 +46,9 @@ describe("R716 set-dir", () => {
     assert.equal(cfg.dir, undefined);
   });
 
-  it("D3 路径不存在 / 是磁盘根目录 / 参数不全：都拒绝，配置不动", async () => {
+  it("D3 路径不存在 / 参数不全：拒绝，配置不动", async () => {
     const before = readFileSync(file, "utf8");
     assert.equal((await run("set-dir", "bot-a", path.join(base, "nope"))).code, 1);
-    assert.equal((await run("set-dir", "bot-a", path.parse(base).root)).code, 1);
     assert.equal((await run("set-dir", "bot-a")).code, 1);
     assert.equal(readFileSync(file, "utf8"), before);
   });
