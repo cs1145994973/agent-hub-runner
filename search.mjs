@@ -4,7 +4,9 @@
 // 零依赖：DDG 的 HTML 解析自己写——开机自启安装只拷文件不装依赖（autostart.mjs 的 COPY_FILES），引第三方库会让自启那份跑不起来。
 // 参考 pi-web-access 的 duckduckgo.ts 的做法（抓 html.duckduckgo.com/html/ 再解析）；DDG 是非官方接口，改版/限流会失败，报错要说人话。
 
-export const SEARCH_PROVIDERS = ["duckduckgo", "tavily", "brave", "searxng"];
+import { randomUUID } from "node:crypto";
+
+export const SEARCH_PROVIDERS = ["duckduckgo", "tavily", "brave", "searxng", "deepseek", "kimi", "kimi_code"];
 export const SEARCH_CACHE_MS = 5 * 60_000; // 同一个查询 5 分钟内不重查，防模型刷搜索
 export const SEARCH_TIMEOUT_MS = 20_000;
 const DDG_URL = "https://html.duckduckgo.com/html/";
@@ -93,7 +95,7 @@ async function searchTavily(query, { count, apiKey, fetchImpl, signal }) {
     body: JSON.stringify({ query, max_results: count }),
   }, signal);
   const data = await res.json();
-  return (data.results ?? []).slice(0, count).map((r) => ({ title: String(r.title ?? ""), url: String(r.url ?? ""), snippet: String(r.content ?? "") }));
+  return (data.results ?? []).slice(0, count);
 }
 
 async function searchBrave(query, { count, apiKey, fetchImpl, signal }) {
@@ -102,7 +104,7 @@ async function searchBrave(query, { count, apiKey, fetchImpl, signal }) {
   url.searchParams.set("count", String(count));
   const res = await request(fetchImpl, url, { headers: { Accept: "application/json", "X-Subscription-Token": apiKey } }, signal);
   const data = await res.json();
-  return (data.web?.results ?? []).slice(0, count).map((r) => ({ title: String(r.title ?? ""), url: String(r.url ?? ""), snippet: String(r.description ?? "") }));
+  return (data.web?.results ?? []).slice(0, count);
 }
 
 async function searchSearxng(query, { count, searxngUrl, fetchImpl, signal }) {
@@ -112,7 +114,40 @@ async function searchSearxng(query, { count, searxngUrl, fetchImpl, signal }) {
   url.searchParams.set("format", "json");
   const res = await request(fetchImpl, url, { headers: { Accept: "application/json", "User-Agent": UA } }, signal);
   const data = await res.json();
-  return (data.results ?? []).slice(0, count).map((r) => ({ title: String(r.title ?? ""), url: String(r.url ?? ""), snippet: String(r.content ?? "") }));
+  return (data.results ?? []).slice(0, count);
+}
+
+async function searchDeepSeek(query, { count, apiKey, fetchImpl, signal }) {
+  const res = await request(fetchImpl, "https://api.deepseek.com/v1/tools/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ query, count, need_content: true }),
+  }, signal);
+  return ((await res.json()).results ?? []).slice(0, count);
+}
+
+async function searchKimi(query, { count, apiKey, fetchImpl, signal }) {
+  const res = await request(fetchImpl, "https://api.moonshot.ai/v1/tools/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ text_query: query, limit: count }),
+  }, signal);
+  return ((await res.json()).search_results ?? []).slice(0, count);
+}
+
+async function searchKimiCode(query, { count, apiKey, fetchImpl, signal }) {
+  const res = await request(fetchImpl, "https://api.kimi.com/coding/v1/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "X-Msh-Tool-Call-Id": randomUUID() },
+    body: JSON.stringify({ text_query: query }),
+  }, signal);
+  return ((await res.json()).search_results ?? []).slice(0, count);
+}
+
+/** 旧的本机配置路径要统一成 title/url/snippet；一次性调用（raw）保留各家原样。 */
+function toSnippet(provider, r) {
+  const text = r.snippet ?? (provider === "brave" ? r.description : r.content);
+  return { title: String(r.title ?? ""), url: String(r.url ?? ""), snippet: String(text ?? "") };
 }
 
 /** 网页下发的配置写本地前的校验（runner.mjs 的 search_config 也用） */
@@ -146,11 +181,13 @@ export function searchConfigStatus(search) {
 export async function searchWeb(query, opts = {}) {
   const q = String(query ?? "").trim();
   if (!q) throw new Error("搜索词不能为空");
-  const search = opts.search ?? {};
+  // R764：服务器可以在这一次请求里临时带上 provider/key/地址，不写进本机配置。没带时仍用旧的本机配置。
+  const search = opts.provider ? { provider: opts.provider, apiKey: opts.apiKey, searxngUrl: opts.endpoint ?? opts.searxngUrl } : (opts.search ?? {});
   const provider = SEARCH_PROVIDERS.includes(search.provider) ? search.provider : "duckduckgo";
   const count = normalizeCount(opts.count);
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const cacheKey = `${provider}|${provider === "searxng" ? search.searxngUrl ?? "" : ""}|${count}|${q}`;
+  const raw = opts.raw === true;
+  const cacheKey = `${provider}|${provider === "searxng" ? search.searxngUrl ?? "" : ""}|${raw ? "raw" : "norm"}|${count}|${q}`;
   const hit = cache.get(cacheKey);
   if (hit && Date.now() - hit.at < SEARCH_CACHE_MS) return { provider, results: hit.results, cached: true };
 
@@ -165,10 +202,20 @@ export async function searchWeb(query, opts = {}) {
   } else if (provider === "searxng") {
     if (!args.searxngUrl) throw new Error("选了 SearXNG 但没填实例地址：在「我的电脑」里填上，或切回 DuckDuckGo。");
     results = await searchSearxng(q, args);
+  } else if (provider === "deepseek") {
+    if (!args.apiKey) throw new Error("选了 DeepSeek 但没配 key：在「设置 → 通用 → 联网搜索」里填上。");
+    results = await searchDeepSeek(q, args);
+  } else if (provider === "kimi") {
+    if (!args.apiKey) throw new Error("选了 Kimi 但没配 key：在「设置 → 通用 → 联网搜索」里填上。");
+    results = await searchKimi(q, args);
+  } else if (provider === "kimi_code") {
+    if (!args.apiKey) throw new Error("选了 Kimi Code 但没配 key：在「设置 → 通用 → 联网搜索」里填上。");
+    results = await searchKimiCode(q, args);
   } else {
     results = await searchDuckDuckGo(q, args);
   }
-  cache.set(cacheKey, { at: Date.now(), results });
+  const out = raw || provider === "duckduckgo" ? results : results.map((r) => toSnippet(provider, r));
+  cache.set(cacheKey, { at: Date.now(), results: out });
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
-  return { provider, results };
+  return { provider, results: out };
 }

@@ -132,6 +132,21 @@ describe("R640 每个 bot 自己的目录", () => {
     }
   });
 
+  it("S16 R773：remove_binding 只删这个 bot 的配置，保留其他绑定和真实目录", async () => {
+    const a = mk("s16-a", "A 不能删"); const b = mk("s16-b", "B 不能删");
+    const { file, cfg } = newCfg("s16", { bot_dirs: { "bot-a": a, "bot-b": b } });
+    const s = createSession(cfg, { log: quiet, platform: "darwin", file });
+    const c = collect();
+    await s.onMessage({ type: "remove_binding", id: "r1", bot_id: "bot-a" }, c.send);
+    assert.deepEqual(c.out, [{ type: "result", id: "r1", ok: true, bot_id: "bot-a" }]);
+    assert.deepEqual(s.botDirs, { "bot-b": b });
+    assert.deepEqual(botDirsOf(JSON.parse(readFileSync(file, "utf8"))), { "bot-b": b });
+    assert.equal(readFileSync(path.join(a, "f.txt"), "utf8"), "A 不能删");
+    assert.equal(readFileSync(path.join(b, "f.txt"), "utf8"), "B 不能删");
+    await s.onMessage({ type: "remove_binding", id: "r2" }, c.send);
+    assert.equal(c.out.at(-1).ok, false);
+  });
+
   it("S5 服务器超时发 abort：弹窗被中止（窗口进程关掉），不回 dir_result，配置不变", async () => {
     const { file, cfg } = newCfg("s5");
     const before = readFileSync(file, "utf8");

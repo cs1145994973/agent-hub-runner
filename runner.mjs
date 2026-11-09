@@ -31,7 +31,7 @@ import { browserStatus, createBrowserManager, installBrowser } from "./browser.m
 import { searchWeb, cleanSearchConfig, searchConfigStatus } from "./search.mjs"; // R751
 import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, COPY_FILES, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3; // R773：remove_binding（软删除 bot 时解除本机目录绑定）
 /** npm 包名，也是装好后的命令名 */
 export const PKG_BIN = "agent-hub-runner";
 /** R666：抽屉里给的、npx 运行时提示里写的命令前缀（@latest：每次都用最新版，也不会被电脑上旧的全局安装盖掉） */
@@ -376,7 +376,10 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     const query = typeof msg.args?.query === "string" ? msg.args.query : "";
     log(`[${bot}] 搜索：${query}`);
     try {
-      const r = await searchImpl(query, { count: msg.args?.count, search: cfg.search });
+      const oneShot = typeof msg.args?.provider === "string"
+        ? { provider: msg.args.provider, apiKey: msg.args.apiKey, endpoint: msg.args.endpoint }
+        : null;
+      const r = await searchImpl(query, { count: msg.args?.count, ...(oneShot ? { ...oneShot, raw: true } : { search: cfg.search }) });
       send({ type: "result", id, ok: true, provider: r.provider, results: r.results, cached: r.cached === true });
     } catch (e) {
       send({ type: "result", id, ok: false, error: e?.message ?? String(e) });
@@ -426,6 +429,19 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     }
   }
 
+  // R773：bot 软删除时解除本机绑定；只删配置里的对应关系，绝不动真实目录。
+  function handleRemoveBinding(send, msg) {
+    const { id } = msg;
+    const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
+    if (!bot) { send({ type: "result", id, ok: false, error: "缺 bot_id" }); return; }
+    const next = { ...dirs };
+    delete next[bot];
+    dirs = next;
+    cfg.bot_dirs = { ...dirs };
+    saveConfig(cfg, file);
+    send({ type: "result", id, ok: true, bot_id: bot });
+  }
+
   async function handlePick(send, msg) {
     const { id } = msg;
     const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
@@ -460,6 +476,7 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     onMessage(msg, send) {
       if (msg.type === "call") return handleCall(send, msg);
       if (msg.type === "set_binding") return handleSetBinding(send, msg);
+      if (msg.type === "remove_binding") return handleRemoveBinding(send, msg);
       if (msg.type === "pick_dir") return handlePick(send, msg);
       if (msg.type === "change_get") return handleChangeGet(send, msg);
       if (msg.type === "browser") return handleBrowser(send, msg); // R729

@@ -138,3 +138,18 @@ test("S14 搜索失败回中文错误；空 query 报错", async () => {
   await s.onMessage({ type: "search", id: "e", bot_id: "b", args: { query: "x" } }, (m) => sent.push(m));
   assert.deepEqual(sent[0], { type: "result", id: "e", ok: false, error: "被限流了" });
 });
+
+test("S15 Kimi Code：coding/v1/search、原样返回 content", async () => {
+  let seen;
+  const fetchImpl = async (url, init) => {
+    seen = { url: String(url), init };
+    return okJson({ search_results: [{ title: "t", url: "https://x", snippet: "s", content: "full", site_name: "site" }] })();
+  };
+  const r = await searchWeb("q", { provider: "kimi_code", apiKey: "k", raw: true, fetchImpl });
+  assert.equal(seen.url, "https://api.kimi.com/coding/v1/search");
+  assert.equal(seen.init.headers.Authorization, "Bearer k");
+  assert.ok(seen.init.headers["X-Msh-Tool-Call-Id"]);
+  assert.deepEqual(JSON.parse(seen.init.body), { text_query: "q" });
+  assert.equal(r.results[0].content, "full");
+  assert.equal(r.results[0].site_name, "site");
+});
