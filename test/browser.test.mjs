@@ -176,6 +176,10 @@ describe("R729 浏览器：真 Chromium（本地测试页）", { skip: !REAL || 
       if (req.url === "/jump-late") { res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end("<title>晚跳</title><button onclick=\"setTimeout(()=>location.href='/',30)\">走</button>"); return; }
       if (req.url === "/slow") { setTimeout(() => { res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end("<title>慢</title>慢页面"); }, 4000); return; }
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      if (req.url === "/more") {
+        res.end(`<title>更多</title><button onmouseenter="document.getElementById('h').textContent='悬停了'">悬停</button><p id="h">没悬停</p><select id="s"><option value="a">甲</option><option value="b">乙</option></select><input id="f" type="file"><button onclick="alert('弹了')">弹窗</button><a href="/" target="_blank">新页</a><p id="late"></p><script>setTimeout(()=>document.getElementById('late').textContent='出现了',300)</script>`);
+        return;
+      }
       res.end(`<title>首页</title><p id="st">${logged ? "已登录" : "未登录"}</p><button onclick="document.getElementById('r').textContent='点到了'">点我</button><p id="r">还没点</p><input placeholder="写点什么">`);
     });
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
@@ -199,6 +203,8 @@ describe("R729 浏览器：真 Chromium（本地测试页）", { skip: !REAL || 
     r = await m.run("bot-a", "type", { ref: Number(inp[1]), text: "你好" });
     assert.match(text(r), /值="你好"/);
     await assert.rejects(m.run("bot-a", "click_ref", { ref: 999 }), /没有编号 \[999\]/);
+    r = await m.run("bot-a", "right_click_ref", { ref: Number(btn[1]) });
+    assert.match(text(r), /点到了|未登录|已登录/);
     r = await m.run("bot-a", "look", { view: "image" });
     assert.equal(r.kind, "image");
     assert.equal(r.mime, "image/jpeg");
@@ -240,6 +246,31 @@ describe("R729 浏览器：真 Chromium（本地测试页）", { skip: !REAL || 
   });
 
   // @意图#R729(2026-11-04): 真机验收时按回车搜索后读元素报 Execution context was destroyed；页面自己跳转时要等稳了再读
+  it("BR13 悬停、下拉、等待、弹窗、标签页和上传", async () => {
+    let r = await m.run("bot-more", "open", { url: `${base}/more` });
+    const hover = /\[(\d+)\] 按钮 "悬停"/.exec(text(r));
+    r = await m.run("bot-more", "hover_ref", { ref: Number(hover[1]) });
+    assert.match(text(r), /悬停了/);
+    const sel = /\[(\d+)\] 下拉框/.exec(text(r));
+    r = await m.run("bot-more", "select", { ref: Number(sel[1]), value: "b" });
+    assert.match(text(r), /乙/);
+    r = await m.run("bot-more", "wait", { text: "出现了", timeout_ms: 3000 });
+    assert.match(text(r), /出现了/);
+    const file = path.join(home, "up.txt");
+    writeFileSync(file, "hi");
+    const input = /\[(\d+)\] 输入框/.exec(text(r));
+    r = await m.run("bot-more", "upload", { ref: Number(input[1]), path: file });
+    assert.equal(r.kind, "elements");
+    await m.run("bot-more", "dialog", { value: "accept" });
+    const alertBtn = /\[(\d+)\] 按钮 "弹窗"/.exec(text(r));
+    r = await m.run("bot-more", "click_ref", { ref: Number(alertBtn[1]) });
+    assert.equal(r.kind, "elements");
+    const link = /\[(\d+)\] 链接/.exec(text(r));
+    r = await m.run("bot-more", "click_ref", { ref: Number(link[1]) });
+    r = await m.run("bot-more", "tab", { index: 1 });
+    assert.match(String(r.url), /\/$/);
+  });
+
   it("BR12 网页自己跳转（打开时马上跳、点了以后跳）：不报错，读到的是跳到的那一页；后台模式 UA 不带 Headless", async () => {
     let r = await m.run("bot-j", "open", { url: `${base}/jump` });
     assert.equal(r.title, "首页");

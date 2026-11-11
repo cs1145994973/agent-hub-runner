@@ -373,6 +373,23 @@ export function createBrowserManager({ env = process.env, log = () => {}, idleMs
       case "look": case "screenshot": case "snapshot": break;
       case "click": await page.mouse.click(num(a.x, "x"), num(a.y, "y")); break;
       case "click_ref": await refOf(e, a.ref).click({ timeout: 10_000 }); break;
+      case "right_click": await page.mouse.click(num(a.x, "x"), num(a.y, "y"), { button: "right" }); break;
+      case "right_click_ref": await refOf(e, a.ref).click({ button: "right", timeout: 10_000 }); break;
+      case "hover": await page.mouse.move(num(a.x, "x"), num(a.y, "y")); break;
+      case "hover_ref": await refOf(e, a.ref).hover({ timeout: 10_000 }); break;
+      case "select": await refOf(e, a.ref).selectOption(String(a.value ?? a.text ?? ""), { timeout: 10_000 }); break;
+      case "dialog": page.once("dialog", (d) => { void (String(a.value ?? "accept") === "dismiss" ? d.dismiss() : d.accept(a.text ? String(a.text) : undefined)); }); break;
+      case "tab": {
+        const pages = e.ctx.pages();
+        const n = Number(a.index ?? 0);
+        const next = pages[n];
+        if (!next) throw new Error(`没有第 ${n} 个标签页`);
+        e.page = next;
+        await next.bringToFront().catch(() => {});
+        break;
+      }
+      case "wait": await page.getByText(String(a.text ?? ""), { exact: false }).first().waitFor({ timeout: Number(a.timeout_ms ?? 10_000) }); break;
+      case "upload": await refOf(e, a.ref).setInputFiles(String(a.path ?? "")); break;
       case "type": {
         const text = String(a.text ?? "");
         if (a.ref !== undefined && a.ref !== null && a.ref !== "") {

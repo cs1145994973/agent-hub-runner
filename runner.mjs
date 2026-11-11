@@ -86,6 +86,7 @@ export function parseArgs(argv) {
     else if (a === "--autostart") out.autostart = true;
     else if (a === "--no-autostart") out.autostart = false;
     else if (a === "--purge") out.purge = true;
+    else if (a === "--replace") out.replace = true;
     else if (a.startsWith("--")) throw new Error(`不认识的参数 ${a}`);
     else out.positional.push(a);
   }
@@ -202,7 +203,12 @@ export async function checkDir(dir) {
 // @意图#R636(2026-10-27): 配对码一次性、5 分钟有效（服务器判断）；授权目录先换成真实路径再存
 // @意图#R666(2026-10-29): 配对码可以写成「码@服务器」（code 里带 @ 时拆开，见 parsePairTarget；显式给了 server 就用 server）；15 秒超时；
 // 连不上、服务器回错都翻成大白话（explainNetError / explainPairFailure）；缺码的提示不再写 runner.mjs
-export async function pair({ code, dir, server, name = os.hostname(), timeoutMs = PAIR_TIMEOUT_MS }, file = configPath()) {
+export async function pair({ code, dir, server, name = os.hostname(), timeoutMs = PAIR_TIMEOUT_MS, replace = false }, file = configPath()) {
+  const existing = existsSync(file) ? loadConfig(file) : null;
+  const target = parsePairTarget(code, server);
+  if (existing?.token && existing.server && existing.server !== target.server && !replace) {
+    throw new Error(`这台电脑已经连着另一台服务器（设备 ${existing.device_id ?? "未知"}，服务器 ${existing.server}）。\n直接运行 ${progName()} start 就能用原来的连接。\n确定换成 ${target.server} 时，再在配对命令最后加上 --replace。`);
+  }
   checkNode();
   const t = parsePairTarget(code, server);
   if (!t.code) throw new Error(`缺配对码：${progName()} pair <配对码>@<服务器地址>（请从网页上原样复制整条命令）`);
@@ -829,7 +835,7 @@ export async function main(argv, prog = progName(), deps = {}) {
   const a = parseArgs(argv);
   const platform = deps.platform ?? process.platform;
   if (a.cmd === "pair") {
-    const r = await pair({ code: a.positional[0], dir: a.dir, server: a.server, name: a.name ?? os.hostname() });
+    const r = await pair({ code: a.positional[0], dir: a.dir, server: a.server, name: a.name ?? os.hostname(), replace: a.replace === true });
     if (r.dirIgnored) console.log(PAIR_DIR_IGNORED);
     const where = "目录：连上后在网页上每个 bot 的私聊里，点输入框下面「我的电脑」那一行选。";
     console.log(`配对成功（服务器 ${r.server}）。${where}\n配置存在 ${r.file}（权限 600）。`);

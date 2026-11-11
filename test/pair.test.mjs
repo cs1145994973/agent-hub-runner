@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { PAIR_DIR_IGNORED, pair } from "../runner.mjs";
+import { PAIR_DIR_IGNORED, pair, saveConfig } from "../runner.mjs";
 
 describe("R640 配对不选目录、不收 --dir", () => {
   let base, srv, server;
@@ -50,6 +50,18 @@ describe("R640 配对不选目录、不收 --dir", () => {
     assert.equal("dir" in cfg, false);
     assert.equal(cfg.token, "tok-test");
     assert.equal(statSync(file).mode & 0o777, 0o600);
+  });
+
+  it("P5 已有配置时默认拒绝覆盖；--replace 才替换", async () => {
+    reqs.length = 0;
+    const file = path.join(base, "p5.json");
+    saveConfig({ server: "http://old", device_id: "dev-old", token: "tok-old", name: "old", bot_dirs: { a: "/keep" } }, file);
+    await assert.rejects(pair({ code: "NEW", server, name: "m" }, file), /另一台服务器/);
+    assert.equal(reqs.length, 0);
+    assert.equal(JSON.parse(readFileSync(file, "utf8")).token, "tok-old");
+    const r = await pair({ code: "NEW", server, name: "m", replace: true }, file);
+    assert.equal(r.deviceId, "dev-test");
+    assert.equal(JSON.parse(readFileSync(file, "utf8")).token, "tok-test");
   });
 
   it("P2 带了 dir（哪怕是根目录、不存在的）：不报错、照常配对，但目录不用：请求和配置里都没有，返回 dirIgnored", async () => {
