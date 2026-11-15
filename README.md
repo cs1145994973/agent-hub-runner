@@ -72,7 +72,7 @@ npx -y agent-hub-runner@latest browser install # 给 bot 装它自己的浏览�
 npx -y agent-hub-runner@latest browser status  # 看浏览器装没装
 ```
 
-开机自启时，程序复制到 `~/.agent-runner/bin/<版本>/`，日志在 `~/.agent-runner/logs/runner.log`（超过 5MB 自动清空）。网页上提示「有新版本」时，0.3.2 起可以直接点「升级」；更早的版本按提示运行那一条升级命令。
+开机自启时，程序复制到 `~/.agent-runner/bin/<版本>/`，日志在 `~/.agent-runner/logs/runner.log`（超过 5MB 自动清空）。网页上提示「有新版本」时，**0.10.1 起**可以直接点「升级」。R839 查实 0.3.2～0.10.0 的网页入口调用了不存在的函数，这些已安装旧版要按提示手动运行一次升级命令；0.3.1 及更早本来就不认网页升级指令。
 
 仓库开发者（R699）：要让仓库里的源码 `runner/runner.mjs` 直接连测试服、开机自启，用 `agent-hub/scripts/runner-test.sh autostart on|off | start | stop | status | log`（launchd 服务 `com.agenthub.runner.src`，日志 `~/.agent-runner/logs/runner-src.log`，不复制程序，改了代码 `start` 一下就生效）。普通用户不用管这个。
 
@@ -99,7 +99,7 @@ npx -y agent-hub-runner@latest browser status  # 看浏览器装没装
 - 想再加一台电脑：网页「我的电脑」抽屉里点「添加电脑」，拿新码到另一台电脑运行。
 - 开机自启报「Bootstrap failed: 5: Input/output error」：这个后台任务以前被 macOS 记成了「已禁用」。0.2.1 起 `autostart on` 会自己解除并重试，直接再运行一次 `npx -y agent-hub-runner@latest autostart on` 就行；还不行就按它给的那条 `launchctl enable …` 命令运行后再试，或重启电脑再试。
 - 升级后网页还说「运行器版本太旧」：旧版本的运行器还在后台跑着（升级前开的终端，或者旧的开机自启），新版一看有人连着就退出了。0.2.2 起新版会自己把旧版本停掉、接上服务器；从 0.2.1 或更早升上来的，运行一次 `npx -y agent-hub-runner@latest autostart on` 就行，它会先停掉正在跑的那个，等新版本真连上了才说「已设开机自启」。
-- 网页上点「升级」（0.3.2 起）：抽屉里有新版本时点一下，运行器自己去 npm 拉最新版、校验后换上并重启，不用开终端。0.3.1 及更早不认这个按钮，仍用上面那条命令升一次。
+- 网页上点「升级」（0.10.1 起）：抽屉里有新版本时点一下，运行器自己去 npm 拉最新版、校验后换上并重启，不用开终端。Mac / Windows 开机自启的换装由独立新版进程执行，不会在 `bootout` / 停计划任务时把升级进程自己杀掉。0.3.2～0.10.0 的网页入口有缺陷，0.3.1 及更早不认这个按钮，都要用上面那条命令手动升一次。
 - 联网搜索（0.4.0 起）：bot 设置里打开「允许联网搜索」后，bot 可以上网查资料。默认用 DuckDuckGo，不用注册、不用 key。想更稳可以在「我的电脑」抽屉里换成 Tavily 或 Brave（去官网注册，把 key 粘进来），或者填一个 SearXNG 地址。key 只存在你电脑上，服务器不留。0.3.x 及更早没有这项，抽屉里会给升级命令。
 - 共享资料库和整台电脑访问需要 **0.5.0**；旧运行器仍能连接，但不知道默认资料库，也不会按新规则放开目录。
 

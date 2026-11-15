@@ -14,7 +14,7 @@ import { promisify } from "node:util";
 import { bootstrapHelp, cleanPath, autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, configTag, installCopy, LABEL, labelFor, logFileFor, ONLY_MAC, pickNode, plistPathFor, plistXml, TASK_PREFIX, taskCmdFor, taskCmdText, taskNameFor, truncateLogIfBig } from "../autostart.mjs";
 import {
   decideAutostart, explainError, explainNetError, explainPairFailure, isNpx, loadConfig, main, NO_DIR, nodeTooOld, NPX_CMD, PAIR_ERR, pair,
-  parsePairTarget, progName, readLock, RUNNER_VERSION, takeLock, newerVersion, waitNewHolder,
+  parsePairTarget, progName, readLock, RUNNER_VERSION, startRunner, takeLock, newerVersion, waitNewHolder,
 } from "../runner.mjs";
 
 const run = promisify(execFile);
@@ -23,6 +23,26 @@ const root = path.resolve(here, "..");
 const runnerFile = path.join(root, "runner.mjs");
 const binFile = path.join(root, "bin", "agent-hub-runner.mjs");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const until = async (fn, message = "等待超时") => {
+  for (let i = 0; i < 100; i++) { if (fn()) return; await sleep(20); }
+  throw new Error(message);
+};
+
+/** 解析这个测试里 runner 发来的小型 masked 文本帧。 */
+function onClientJson(c, fn) {
+  c.sock.on("data", (buf) => {
+    if ((buf[0] & 0x0f) !== 1) return;
+    let n = buf[1] & 0x7f; let off = 2;
+    if (n === 126) { n = buf.readUInt16BE(2); off = 4; }
+    if (n === 127) return;
+    const masked = (buf[1] & 0x80) !== 0;
+    const mask = masked ? buf.subarray(off, off + 4) : null;
+    if (masked) off += 4;
+    const data = Buffer.from(buf.subarray(off, off + n));
+    if (mask) for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+    try { fn(JSON.parse(data.toString("utf8"))); } catch { /* 非本测试文本 */ }
+  });
+}
 
 /** 最小的 WebSocket 服务器（不用第三方包）：握手后交给 onConn，可以发文字帧、用某个关闭码关掉 */
 function wsServer(onConn) {
@@ -231,6 +251,55 @@ describe("R666 更傻瓜的安装配对", () => {
       const r2 = await run(process.execPath, [runnerFile, "start"], { env });
       assert.match(r2.stderr, /配置文件坏了/);
     } finally { w.srv.close(); }
+  });
+
+  it("R17 R839：真实 WebSocket self_update 入口可执行；重复不并发；失败保留旧版并可重试；成功才退出", async () => {
+    const received = [];
+    let conn;
+    const w = wsServer((c) => {
+      conn = c;
+      onClientJson(c, (m) => {
+        received.push(m);
+        if (m.type === "hello") c.text(JSON.stringify({ type: "ready" }));
+      });
+    });
+    const server = await w.listen();
+    const file = path.join(tmp, "r17", "config.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    const calls = [];
+    let releaseFirst = () => {};
+    const first = new Promise((r) => { releaseFirst = r; });
+    const runner = startRunner(
+      { server, device_id: "dev-r17", token: "tok", bot_dirs: {} },
+      { file, log: () => {}, platform: "darwin", selfUpdate: async (o) => {
+        calls.push(o);
+        if (calls.length === 1) { await first; return { ok: false, error: "模拟下载失败" }; }
+        return { ok: true, version: "0.10.1" };
+      } },
+    );
+    let finished = false;
+    void runner.done.then(() => { finished = true; });
+    try {
+      await until(() => received.some((m) => m.type === "hello"), "没收到 hello");
+      conn.text(JSON.stringify({ type: "self_update" }));
+      conn.text(JSON.stringify({ type: "self_update" }));
+      await until(() => received.some((m) => m.type === "self_update_result" && /正在升级/.test(m.error ?? "")), "重复指令没有回执");
+      assert.equal(calls.length, 1, "重复指令不得并发升级");
+      assert.equal(calls[0].file, file);
+      assert.equal(calls[0].platform, "darwin");
+      releaseFirst();
+      await until(() => received.some((m) => m.type === "self_update_result" && /模拟下载失败/.test(m.error ?? "")), "失败原因没回给网页");
+      await sleep(30);
+      assert.equal(finished, false, "失败时旧 runner 必须继续跑");
+      conn.text(JSON.stringify({ type: "self_update" }));
+      await until(() => calls.length === 2 && finished, "成功后没有完成新旧交接");
+      assert.ok(received.some((m) => m.type === "self_update_result" && m.ok === true && m.version === "0.10.1"));
+    } finally {
+      releaseFirst();
+      runner.stop();
+      for (const c of w.conns) c.sock.destroy();
+      w.srv.close();
+    }
   });
 
   it("R9 plist：ProgramArguments = [node, ~/.agent-runner/bin/current/runner.mjs, start]、环境变量写明配置绝对路径、RunAtLoad、KeepAlive 只非 0 拉起、ThrottleInterval 10、日志；值会转义", () => {

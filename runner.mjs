@@ -548,9 +548,26 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
   const send = (sock, msg) => { if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(msg)); };
   const browserInfo = () => { try { const b = browserStatus(); return { installed: b.installed, version: b.version }; } catch { return { installed: false, version: null }; } };
 
-  // @意图#R750(2026-11-07): 网页点「升级」发来 self_update（不带参数）。自己查最新版、校验、换上、拉起新版，回一条结果后正常退出，
-  //   让新版接上。失败了回原因，旧版继续跑。同时只跑一个，重复发来的忽略。
+  // @意图#R839(2026-11-15): R750 的入口曾调用不存在的 runSelfUpdate，网页一点就 ReferenceError；这里真正接上 handleSelfUpdate。
+  // 同时只跑一个；重复指令马上回原因，失败保留旧版，成功才停旧进程让新版接管。
   let updating = false;
+  async function runSelfUpdate(sock) {
+    if (updating || stopped) {
+      send(sock, { type: "self_update_result", ok: false, error: stopped ? "运行器正在停止" : "正在升级，请稍候" });
+      return;
+    }
+    updating = true;
+    try {
+      const quit = await handleSelfUpdate({ file, platform, selfUpdate: selfUpdateFn ?? selfUpdate, log }, (m) => send(sock, m));
+      if (quit) stop();
+    } catch (e) {
+      const error = e?.message ?? String(e);
+      log(`升级没成：${error}`);
+      send(sock, { type: "self_update_result", ok: false, error: `升级失败：${error}` });
+    } finally {
+      updating = false;
+    }
+  }
   function connect() {
     if (stopped) return;
     const sock = new WebSocket(wsUrlOf(cfg.server));
@@ -766,16 +783,17 @@ export async function extractPack(buf) {
  * 拉起新版后台进程。新版从刚装好的副本起，不从下载的临时目录起。
  * 开机自启的交给 launchd / 计划任务重新加载（新版按 R732 顶掉旧的）；没开的自己起一个后台进程，等它拿到锁。
  */
-export async function spawnUpdated({ version, file, env = process.env, platform = process.platform, launchctl, schtasks, spawnFn = spawn, wait = waitNewHolder }) {
+export async function spawnUpdated({ version, file, env = process.env, platform = process.platform, spawnFn = spawn, wait = waitNewHolder }) {
   const script = path.join(runnerHome(env), "bin", version, "runner.mjs");
-  if (platform === "win32" && env.AGENT_RUNNER_LAUNCHD === "1") {
-    await autostartOnWindows({ configFile: file, version, srcDir: path.dirname(script), execPath: process.execPath, env, schtasks });
-  } else if (platform === "darwin" && env.AGENT_RUNNER_LAUNCHD === "1") {
-    await autostartOn({ configFile: file, version, srcDir: path.dirname(script), execPath: process.execPath, env, launchctl, platform });
-  } else {
-    const child = spawnFn(process.execPath, [script, "start"], { detached: true, stdio: "ignore", env: { ...env, AGENT_RUNNER_LAUNCHD: "" } });
-    child.unref();
-  }
+  // R839：自启换装必须像用户手动 npx autostart on 一样由另一个进程做。旧 runner 若亲自 bootout / 停计划任务，
+  // 会先把执行升级的自己杀掉；独立的新版本副本不受旧进程退出影响。前台升级仍只 start 新版。
+  const autostart = (platform === "darwin" || platform === "win32") && env.AGENT_RUNNER_LAUNCHD === "1";
+  const child = spawnFn(process.execPath, [script, ...(autostart ? ["autostart", "on"] : ["start"])], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...env, AGENT_RUNNER_CONFIG: file, AGENT_RUNNER_LAUNCHD: "" },
+  });
+  child.unref();
   const got = await wait(file, { version });
   if (!got) throw new Error("新版没有接上");
   return got;

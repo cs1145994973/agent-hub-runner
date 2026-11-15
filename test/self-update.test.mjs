@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { integrityOk } from "../autostart.mjs";
-import { handleSelfUpdate, selfUpdate } from "../runner.mjs";
+import { handleSelfUpdate, selfUpdate, spawnUpdated } from "../runner.mjs";
 
 const sha512 = (buf) => `sha512-${createHash("sha512").update(buf).digest("base64")}`;
 
@@ -107,5 +107,35 @@ describe("R750 运行器自己升级", () => {
     );
     assert.equal(quit2, true);
     assert.deepEqual(sent2[0], { type: "self_update_result", ok: true, version: "0.3.2" });
+  });
+
+  it("U7 R839：Mac/Windows 自启换装由独立新版进程 autostart on；旧 runner 不亲自 bootout；前台仍 start", async () => {
+    for (const platform of ["darwin", "win32"]) {
+      const home = path.join(base, `u7-${platform}`);
+      const file = path.join(base, `u7-${platform}.json`);
+      let call;
+      let unref = false;
+      await spawnUpdated({
+        version: "0.10.1", file, platform,
+        env: { AGENT_RUNNER_HOME: home, AGENT_RUNNER_LAUNCHD: "1" },
+        spawnFn: (...args) => { call = args; return { unref: () => { unref = true; } }; },
+        wait: async () => ({ pid: 123 }),
+      });
+      assert.equal(call[0], process.execPath);
+      assert.deepEqual(call[1], [path.join(home, "bin", "0.10.1", "runner.mjs"), "autostart", "on"]);
+      assert.equal(call[2].detached, true);
+      assert.equal(call[2].stdio, "ignore");
+      assert.equal(call[2].env.AGENT_RUNNER_CONFIG, file);
+      assert.equal(call[2].env.AGENT_RUNNER_LAUNCHD, "");
+      assert.equal(unref, true);
+    }
+    let foreground;
+    await spawnUpdated({
+      version: "0.10.1", file: path.join(base, "u7-front.json"), platform: "darwin",
+      env: { AGENT_RUNNER_HOME: path.join(base, "u7-front"), AGENT_RUNNER_LAUNCHD: "" },
+      spawnFn: (...args) => { foreground = args; return { unref: () => {} }; },
+      wait: async () => ({ pid: 124 }),
+    });
+    assert.deepEqual(foreground[1].slice(1), ["start"]);
   });
 });
