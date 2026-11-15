@@ -51,7 +51,7 @@ describe("R664 npm 小工具的运行方式", () => {
   it("B3 文件在 node_modules 里（Windows 的 .cmd 是直接 node 这个文件）：也写 agent-hub-runner；仓库里跑 bin 写 node 相对路径", async () => {
     const pkg = path.join(tmp, "lib", "node_modules", PKG_BIN);
     mkdirSync(path.join(pkg, "bin"), { recursive: true });
-    for (const f of ["runner.mjs", "ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "autostart.mjs", "search.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f));
+    for (const f of ["runner.mjs", "ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f));
     cpSync(binFile, path.join(pkg, "bin", "agent-hub-runner.mjs"));
     const r = await run(process.execPath, [path.join(pkg, "bin", "agent-hub-runner.mjs")], { cwd: tmp });
     assert.ok(r.stdout.includes("agent-hub-runner pair <配对码>"), r.stdout);
@@ -84,7 +84,7 @@ describe("R664 npm 小工具的运行方式", () => {
     assert.match(p.version, /^\d+\.\d+\.\d+$/); // R723：只校版本号格式，发版不用再改这条
     assert.equal(p.type, "module");
     assert.deepEqual(p.bin, { [PKG_BIN]: "bin/agent-hub-runner.mjs" });
-    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "ops.mjs", "project-context.mjs", "runner.mjs", "search.mjs"]);
+    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser-recorder.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "file-upload.mjs", "ops.mjs", "project-context.mjs", "runner.mjs", "search.mjs", "tab-recorder.mjs"]);
     assert.equal(p.engines.node, ">=22");
     assert.equal(p.dependencies, undefined);
   });

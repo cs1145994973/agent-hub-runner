@@ -120,7 +120,33 @@ npx -y agent-hub-runner@latest browser status  # 看浏览器装没装
 - 每个 bot 一个资料目录 `~/.agent-runner/browser-profiles/<bot>/`，登录状态会保存。平时在后台（没有窗口）跑，闲 10 分钟自动关。
 - 要登录、扫码、过验证码：在网页「我的电脑」抽屉里点「打开 bot 的浏览器」，会弹出这个 bot 的浏览器窗口，你弄好后直接关掉窗口，bot 接着在后台用。
 - 不想让 bot 用浏览器：网页右栏「bot设置」里取消勾「允许用浏览器」。想清掉登录状态：删掉那个 bot 的资料目录。
-- 卸载：删掉 `~/.agent-runner/browser`、`~/.agent-runner/browsers`、`~/.agent-runner/browser-profiles` 三个文件夹。
+- 卸载：删掉 `~/.agent-runner/browser`、`~/.agent-runner/browsers`、`~/.agent-runner/browser-profiles` 三个文件夹；录像也要删时，再删 `~/.agent-runner/recordings`。
+
+### 浏览器录像（0.9.0 起）
+
+- **A：录当前 bot 浏览器**：AI 用 `browser(record_start)` 开始、继续操作、`browser(record_stop)` 停止，得到本机 MP4。可选 `path`（绝对路径）、`fps`（默认 10）、`max_seconds`（默认 60，最长 180）、`show_cursor`。默认文件在 `~/.agent-runner/recordings/<botId>/`。关闭浏览器或切换窗口模式会先保存；录制中不能切标签页。
+- **B：独立标签页录像**：AI 在一次性测试脚本里导入 `runner/tab-recorder.mjs` 的 `withTabRecorder`，适合自动测试线上网页或网页游戏。`audio:true` 可录标签页声音，`showCursor:true` 可显示网页指针，`output` 支持 `.webm` / `.mp4`。测试脚本先打开页面、点击开始并等声音/画面准备好，再调用 `start()`，避免录进缓冲。
+- B 使用独立 Chromium 和新 BrowserContext，不读当前 bot 的登录资料；自动接受标签页采集的启动参数只给这只测试浏览器。录制中刷新或跳转可能中断，需要分段，不会假装完整成功。
+- 网页指针是录制期间注入的辅助圆点，只跟网页内指针，不是系统光标，也不拦截点击。A 不含音频；B 录的是标签页声音，不是麦克风或整个电脑的系统声音。
+- A 和 B 输出 MP4 都需要本机 ffmpeg；找不到时明确报错，不自动安装。可用 `AGENT_HUB_FFMPEG` 指定路径。B 输出 WebM 不需要 ffmpeg。录像默认只存本机；要发给客户时由 AI 另行显式调用 `send_files`，不会自动上传。AI 要检查内容时按需自行抽帧。
+
+```js
+import { withTabRecorder } from "./runner/tab-recorder.mjs";
+
+await withTabRecorder({ output: "game.mp4", audio: true }, async ({ page, start }) => {
+  await page.goto("https://example.com/game");
+  await page.click("#start");
+  await start();
+  // 自动测试与断言……
+});
+```
+
+## bot 发文件给客户（0.10.0 起）
+
+- AI 在当前私聊调用 `send_files({paths, text?})`，可把这台电脑上的 1～20 个文件/图片作为一条消息发给客户；不能发群。相对路径按当前 bot 工作目录解析，绝对路径按本机实际位置读取。
+- 运行器收到 `file_upload` 后，用服务器给的一次性短时票据进行 HTTP 流式上传；文件内容不经过 WebSocket Base64。票据只能用于当前这批文件，不能长期随便上传。
+- 单文件最多 200 MB、图片 32 MB、整批 500 MB；目录、空文件、超限会在本机提前拒绝。上传期间停止或断线会中止，原文件不改变。服务器保存 30 天，失败批次会清理未使用附件。
+- 0.9.x 及更早没有 `file_upload`，服务器会明确提示升级，不会静默等待。
 
 ## 安全提示
 

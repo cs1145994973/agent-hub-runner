@@ -29,6 +29,7 @@ import { runOp } from "./ops.mjs";
 import { buildChangeRecord, changesDirFor, CHANGE_ID_RE, createChangeStore } from "./changes.mjs";
 import { browserStatus, createBrowserManager, installBrowser } from "./browser.mjs";
 import { searchWeb, cleanSearchConfig, searchConfigStatus } from "./search.mjs"; // R751
+import { uploadLocalFile } from "./file-upload.mjs"; // R823
 import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, COPY_FILES, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
 export const PROTOCOL_VERSION = 3; // R773：remove_binding（软删除 bot 时解除本机目录绑定）
@@ -360,6 +361,22 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     }
   }
 
+  /** R823：文件内容走一次性 HTTP 票据，WS 只回附件元数据；断线/停止会中止上传。 */
+  async function handleFileUpload(send, msg) {
+    const { id } = msg;
+    const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
+    if (!bot) { send({ type: "result", id, ok: false, error: "缺 bot_id" }); return; }
+    const ac = new AbortController(); jobs.set(id, ac);
+    log(`[${bot}] 上传文件：${msg.args?.path ?? ""}`);
+    try {
+      const attachment = await uploadLocalFile({ server: cfg.server, upload: msg.args?.upload, path: msg.args?.path,
+        root: dirs[bot] ?? sharedLibrary, signal: ac.signal, maxBytes: msg.args?.max_bytes });
+      if (ac.signal.aborted) send({ type: "result", id, ok: false, error: "已中止" });
+      else send({ type: "result", id, ok: true, attachment });
+    } catch (e) { send({ type: "result", id, ok: false, error: e?.message ?? String(e) }); }
+    finally { jobs.delete(id); }
+  }
+
   // @意图#R729(2026-11-04): bot 用浏览器：全部自动允许（不弹卡）；打字只记字数（可能是密码）
   async function handleBrowser(send, msg) {
     const { id } = msg;
@@ -486,6 +503,7 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       if (msg.type === "pick_dir") return handlePick(send, msg);
       if (msg.type === "change_get") return handleChangeGet(send, msg);
       if (msg.type === "browser") return handleBrowser(send, msg); // R729
+      if (msg.type === "file_upload") return handleFileUpload(send, msg); // R823
       if (msg.type === "browser_open") return handleBrowserOpen(send, msg); // R729
       if (msg.type === "search") return handleSearch(send, msg); // R751
       if (msg.type === "search_config") return handleSearchConfig(send, msg); // R751

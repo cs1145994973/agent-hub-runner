@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { runnerHome } from "./autostart.mjs";
+import { createCdpRecorder, DEFAULT_RECORD_FPS, DEFAULT_RECORD_MAX_SECONDS, MAX_RECORD_SECONDS } from "./browser-recorder.mjs";
 
 /** 装哪个版本的 playwright-core（钉死；换版本要一起改这里、测试和文档） */
 export const PW_VERSION = "1.64.1";
@@ -43,6 +44,11 @@ export const CLOSED_BY_USER = "浏览器窗口被关掉了，这一步没做完�
 export function profileDirFor(botId, env = process.env) {
   if (typeof botId !== "string" || !/^[A-Za-z0-9._-]{1,100}$/.test(botId) || botId === "." || botId === "..") throw new Error(`bot_id 不合法：${String(botId)}`);
   return path.join(profilesDir(env), botId);
+}
+
+export function recordingsDirFor(botId, env = process.env) {
+  profileDirFor(botId, env);
+  return path.join(runnerHome(env), "recordings", botId);
 }
 
 /** 不加载 playwright，只看文件：装没装、版本对不对、Chromium 在不在。 */
@@ -231,7 +237,9 @@ export function createBrowserManager({ env = process.env, log = () => {}, idleMs
   async function closeEntry(botId, e) {
     clearTimeout(e.timer);
     if (bots.get(botId) === e) bots.delete(botId);
+    const recording = e.recorder ? await e.recorder.stop().catch((err) => ({ kind: "text", text: `关闭浏览器时录像收尾失败：${err.message}` })) : null;
     await e.ctx.close().catch(() => {});
+    return recording;
   }
 
   async function launch(botId, headed, urls = []) {
@@ -250,9 +258,13 @@ export function createBrowserManager({ env = process.env, log = () => {}, idleMs
       if (/ProcessSingleton|SingletonLock|profile.*in use|already in use/i.test(m)) throw new Error("这个 bot 的浏览器资料目录正被另一只浏览器占着（可能是上次没关干净），先把那个 Chromium 窗口关掉再试。");
       throw new Error(`浏览器没打开：${m.split("\n")[0]}`);
     }
-    const e = { ctx, headed, page: null, refs: [], gen: ++gen, timer: undefined };
+    const e = { ctx, headed, page: null, refs: [], gen: ++gen, timer: undefined, recorder: null };
     ctx.on("page", (p) => { if (bots.get(botId) === e) e.page = p; }); // 点了链接开新标签页：跟过去
-    ctx.on("close", () => { if (bots.get(botId) === e) { clearTimeout(e.timer); bots.delete(botId); if (e.headed) log(`[${botId}] 浏览器窗口关掉了，之后 bot 用浏览器会在后台打开`); } });
+    ctx.on("close", () => { if (bots.get(botId) === e) {
+      clearTimeout(e.timer); bots.delete(botId);
+      if (e.recorder) void e.recorder.stop().then((r) => log(`[${botId}] ${r.text}`)).catch((err) => log(`[${botId}] 录像收尾失败：${err.message}`));
+      if (e.headed) log(`[${botId}] 浏览器窗口关掉了，之后 bot 用浏览器会在后台打开`);
+    } });
     bots.set(botId, e);
     const pages = ctx.pages();
     for (let i = 0; i < urls.length; i++) {
@@ -357,7 +369,10 @@ export function createBrowserManager({ env = process.env, log = () => {}, idleMs
   const num = (v, name) => { const n = Number(v); if (!Number.isFinite(n)) throw new Error(`${name} 要是数字`); return n; };
 
   async function act(e, action, a) {
-    if (action === "close") { await closeEntry(a.__bot, e); return { kind: "text", text: "浏览器关掉了（登录状态还在，下次用会重新打开）" }; }
+    if (action === "close") {
+      const recording = await closeEntry(a.__bot, e);
+      return { kind: "text", text: ["浏览器关掉了（登录状态还在，下次用会重新打开）", recording?.text].filter(Boolean).join("\n") };
+    }
     let page = currentPage(e) ?? await e.ctx.newPage();
     e.page = page;
     switch (action) {
@@ -371,6 +386,22 @@ export function createBrowserManager({ env = process.env, log = () => {}, idleMs
         break;
       }
       case "look": case "screenshot": case "snapshot": break;
+      case "record_start": {
+        if (e.recorder && !e.recorder.isFinished()) throw new Error("这个 bot 正在录像，先 record_stop 再开始新的");
+        const fps = a.fps === undefined ? DEFAULT_RECORD_FPS : Number(a.fps);
+        const maxSeconds = a.max_seconds === undefined ? DEFAULT_RECORD_MAX_SECONDS : Number(a.max_seconds);
+        if (!Number.isInteger(fps) || fps < 1 || fps > 15) throw new Error("fps 要是 1～15 的整数");
+        if (!Number.isFinite(maxSeconds) || maxSeconds < 1 || maxSeconds > MAX_RECORD_SECONDS) throw new Error(`max_seconds 要在 1～${MAX_RECORD_SECONDS} 之间`);
+        const output = a.path ? String(a.path) : path.join(recordingsDirFor(a.__bot, env), `recording-${Date.now()}.mp4`);
+        if (!path.isAbsolute(output) || !output.toLowerCase().endsWith(".mp4")) throw new Error("record_start 的 path 要是本机绝对路径，且以 .mp4 结尾");
+        const recorder = createCdpRecorder({ page, output, fps, maxSeconds, showCursor: a.show_cursor === true, env });
+        e.recorder = recorder;
+        try { return await recorder.start(); } catch (err) { e.recorder = null; throw err; }
+      }
+      case "record_stop": {
+        if (!e.recorder) throw new Error("这个 bot 没有开始录像");
+        return await e.recorder.stop();
+      }
       case "click": await page.mouse.click(num(a.x, "x"), num(a.y, "y")); break;
       case "click_ref": await refOf(e, a.ref).click({ timeout: 10_000 }); break;
       case "right_click": await page.mouse.click(num(a.x, "x"), num(a.y, "y"), { button: "right" }); break;
@@ -380,6 +411,7 @@ export function createBrowserManager({ env = process.env, log = () => {}, idleMs
       case "select": await refOf(e, a.ref).selectOption(String(a.value ?? a.text ?? ""), { timeout: 10_000 }); break;
       case "dialog": page.once("dialog", (d) => { void (String(a.value ?? "accept") === "dismiss" ? d.dismiss() : d.accept(a.text ? String(a.text) : undefined)); }); break;
       case "tab": {
+        if (e.recorder && !e.recorder.isFinished()) throw new Error("正在录制当前标签页，先 record_stop 再切换");
         const pages = e.ctx.pages();
         const n = Number(a.index ?? 0);
         const next = pages[n];
@@ -406,6 +438,7 @@ export function createBrowserManager({ env = process.env, log = () => {}, idleMs
     }
     if (action !== "look" && action !== "screenshot" && action !== "snapshot") await settle(currentPage(e) ?? page);
     page = currentPage(e) ?? page;
+    if (e.recorder && !e.recorder.isFinished()) await e.recorder.refreshPointer();
     const view = action === "snapshot" ? "elements" : a.view === "image" ? "image" : "elements";
     return observe(e, page, view);
   }
