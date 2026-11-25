@@ -31,7 +31,7 @@ import { browserStatus, createBrowserManager, installBrowser } from "./browser.m
 import { searchWeb, cleanSearchConfig, searchConfigStatus } from "./search.mjs"; // R751
 import { uploadLocalFile } from "./file-upload.mjs"; // R823
 import { createOfficial } from "./official.mjs"; // R912
-import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, COPY_FILES, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
+import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, switchCurrent, truncateLogIfBig } from "./autostart.mjs";
 
 export const PROTOCOL_VERSION = 4; // R773：remove_binding（软删除 bot 时解除本机目录绑定）；R912：官方套餐登录 / 模型请求转发
 /** npm 包名，也是装好后的命令名 */
@@ -770,6 +770,10 @@ async function runStart(prog = progName(), deps = {}) {
     console.log(`已经在后台连着，不用再开（进程 ${lock.pid}${lock.launchd ? "，开机自启起的" : ""}）。要停掉它：${prog} stop`);
     process.exit(0);
   }
+  // @意图#R977(2026-11-25): 拿着锁的这个进程就是「当前版本」。升级时旧版先把新副本摆好、不换指针，
+  //   新版拿到锁后在这里把 current 指向自己；旧版来不及换（或被结束）也不会留下一个指向废副本的指针。
+  //   只在「自己就在 <home>/bin/<版本>/ 里跑」时校正，npx 缓存、源码目录里跑的不碰（详见 pointCurrentAtSelf）。
+  pointCurrentAtSelf({ env: process.env });
   const r = startRunner(cfg, { file, background });
   const quit = () => { r.stop(); lock.release(); setTimeout(() => process.exit(0), 100); };
   process.on("SIGINT", quit);
@@ -851,7 +855,7 @@ export async function downloadPack(latest, fetchImpl = globalThis.fetch, timeout
   if (!r.ok) throw new Error(`下载失败 ${r.status}`);
   return Buffer.from(await r.arrayBuffer());
 }
-/** 解压 tgz 到临时目录，返回 package/ 子目录（npm 包的根）。只取运行器自己那几份文件，不执行包里的任何东西。 */
+/** 解压 tgz 到临时目录，返回 package/ 子目录（npm 包的根）。不执行包里的任何东西；拷什么由 installCopy 按来源包的 files 决定。 */
 export async function extractPack(buf) {
   const { mkdtempSync } = await import("node:fs");
   const dir = mkdtempSync(path.join(os.tmpdir(), "agent-runner-upd-"));
@@ -859,10 +863,8 @@ export async function extractPack(buf) {
   const done = new Promise((resolve, reject) => { tar.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`解压失败 ${code}`))); tar.on("error", reject); });
   tar.stdin.end(buf);
   await done;
-  const pkg = path.join(dir, "package");
-  const { readdirSync } = await import("node:fs");
-  for (const name of readdirSync(pkg)) if (!COPY_FILES.includes(name)) rmSync(path.join(pkg, name), { recursive: true, force: true });
-  return pkg;
+  // @意图#R977(2026-11-25): 不再用旧版 COPY_FILES 筛新包——那会把新版本新增的模块删掉，装出一个起不来的新副本。
+  return path.join(dir, "package");
 }
 /**
  * 拉起新版后台进程。新版从刚装好的副本起，不从下载的临时目录起。
@@ -903,14 +905,34 @@ export async function selfUpdate({ file = configPath(), env = process.env, platf
   if (!integrityOk(buf, latest.integrity)) return { ok: false, error: "下载的包校验对不上，没有更换" };
   let srcDir;
   try { srcDir = await extract(buf, latest.version); } catch (e) { return { ok: false, error: `解压失败，没有更换：${e?.message ?? e}` }; }
-  installCopy({ srcDir, version: latest.version, env, platform });
+  // @意图#R977(2026-11-25): 先把文件摆好，**不**换 current 指针（新版自己拿到锁后会把指针指向自己，见 runStart）。
+  //   以前先换指针再拉进程，拉不起来时 launchd 一直去跑那个没验证过的新副本，一重启/重登就彻底连不上。
+  try { installCopy({ srcDir, version: latest.version, env, platform, switchCurrent: false }); }
+  catch (e) { return { ok: false, error: `装不上新版本，没有更换：${e?.message ?? e}` }; }
   try {
     await spawnNext({ version: latest.version, file, env });
   } catch (e) { return { ok: false, error: `新版没接上，没有换掉正在跑的：${e?.message ?? e}` }; }
+  // @意图#R977(2026-11-25): 指针不在这里换——新版自己会换（自启路 autostartOn→installCopy、前台路 runStart→
+  //   pointCurrentAtSelf）。旧版只负责「摆文件 + 拉起新版 + 等它拿锁」，写 current 只有一处，不两份各写一次。
   return { ok: true, version: latest.version };
 }
 
 const here = () => path.dirname(fileURLToPath(import.meta.url));
+// @意图#R977(2026-11-25): 升级时旧版不换指针，新版拿到锁后再把 current 指向自己。
+/**
+ * 把 current 指针校正到自己。只有「我就在 <home>/bin/<版本>/ 里跑」时才动；
+ * npx 缓存、源码目录里跑的不碰（那不是被 launchd 拉起的那份）。
+ * 返回是否真的改了指针；改不了不抛错。
+ */
+export function pointCurrentAtSelf({ version = RUNNER_VERSION, env = process.env, hereDir = here(), platform = process.platform } = {}) {
+  const binRoot = path.join(runnerHome(env), "bin");
+  const destDir = path.join(binRoot, version);
+  if (real(hereDir) !== real(destDir)) return false;
+  const cur = path.join(binRoot, "current");
+  const points = (() => { try { return real(cur); } catch { return null; } })();
+  if (points === real(destDir)) return false; // 已经指着自己，不用动
+  try { switchCurrent({ version, env, platform }); return true; } catch { return false; }
+}
 // @意图#R666(2026-10-29): 开启自启：前台有一个在跑就先停掉它（不然后台那个起来就因为锁退出了），再交给 autostart.mjs（复制自己、写 plist、加载）
 // @意图#R725(2026-11-03): Windows 走计划任务（autostartOnWindows），Mac 走 launchd。提示里的「这台 Mac」按平台写。
 // @意图#R732(2026-11-04): 不管拿着锁的是终端里的还是开机自启起的（包括别的标签起的旧版本），一律先停掉；装好后等新版本真的拿到锁才报「已设开机自启」，没接上就说清楚、给日志位置

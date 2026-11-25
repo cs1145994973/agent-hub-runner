@@ -10,7 +10,6 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
-import { COPY_FILES } from "../autostart.mjs";
 import { RUNNER_VERSION } from "../runner.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -118,7 +117,14 @@ describe("R841 网页自升级真实新旧进程交接", () => {
     nextVersion = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
     const pkgDir = path.join(base, "fake", "package");
     mkdirSync(pkgDir, { recursive: true });
-    for (const f of COPY_FILES) copyFileSync(path.join(root, f), path.join(pkgDir, f));
+    // @意图#R977(2026-11-25): 真实包按 package.json files 拷（不读 COPY_FILES），跟 npm 发布出去的一致；
+    //   连这个测试都不依赖 COPY_FILES，那个兜底常量就只剩「手改过的包」一种情形了。
+    const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+    for (const f of [...manifest.files, "package.json"]) {
+      const to = path.join(pkgDir, f);
+      mkdirSync(path.dirname(to), { recursive: true });
+      copyFileSync(path.join(root, f), to);
+    }
     const pkg = JSON.parse(readFileSync(path.join(pkgDir, "package.json"), "utf8"));
     pkg.version = nextVersion;
     writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify(pkg, null, 2));

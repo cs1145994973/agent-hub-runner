@@ -1,7 +1,7 @@
 // @意图#R751(2026-11-07): king 确认 R751：运行器内置联网搜索，网页开关可选。
 // 默认 DuckDuckGo 抓公开结果页（免注册免 key），可选 Tavily / Brave key、SearXNG 实例地址。
 // key 只存本机 config.json（600），由网页下发（runner.mjs 的 search_config），服务器不存。
-// 零依赖：DDG 的 HTML 解析自己写——开机自启安装只拷文件不装依赖（autostart.mjs 的 COPY_FILES），引第三方库会让自启那份跑不起来。
+// 零依赖：DDG 的 HTML 解析自己写——开机自启安装只拷文件不装依赖（autostart.mjs 的 filesToCopy），引第三方库会让自启那份跑不起来。
 // 参考 pi-web-access 的 duckduckgo.ts 的做法（抓 html.duckduckgo.com/html/ 再解析）；DDG 是非官方接口，改版/限流会失败，报错要说人话。
 
 import { randomUUID } from "node:crypto";

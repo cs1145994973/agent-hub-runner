@@ -20,7 +20,27 @@ export const THROTTLE_S = 10;
 /** 复制到 ~/.agent-runner/bin/<版本>/ 的文件（package.json 用来读版本号） */
 // @意图#R729(2026-11-04): 多复制 browser.mjs（runner.mjs 要 import 它）
 // @意图#R690(2026-11-01): 多复制 changes.mjs（runner.mjs 要 import 它，少了开机自启的副本起不来）
+// @意图#R977(2026-11-25): 这个清单只在「来源没有可用 files 字段」时兜底。真实安装一律以来源包自己的
+//   package.json files 为准：跨版本升级时用旧版清单筛新包，会把新版本新增的模块（official.mjs /
+//   oauth.bundle.mjs / search-ops.mjs）当垃圾删掉，新副本一启动就 ERR_MODULE_NOT_FOUND。
+//   **删除条件**：实测 0.14.0 的实际 tgz 带 files（16 条），0.10.0/0.10.1 也一样（都是同一份 package.json 派生的）。
+//   这个兜底现在只能对应「测试互拷」和「手改过的包」两种情形。一旦测试改成自建临时包、不再 import 它
+//   （真期待：下一步就把 test/self-update-process.test.mjs 改成读 files），它就彻底没人用，那时删掉。
+//   在那之前它是防御性兜底，不是第二份真源：filesToCopy 有可用 files 时绝不读它。
 export const COPY_FILES = ["runner.mjs", "ops.mjs", "search-ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "official.mjs", "oauth.bundle.mjs", "package.json"]; // search.mjs：R751 联网搜索；official.mjs + oauth.bundle.mjs：R912 官方套餐；search-ops.mjs：R943 grep/find/ls
+/**
+ * R977：要复制的文件清单——读来源包自己的 package.json `files`（npm 发布时声明的就是这些），
+ * 外加 package.json 本身；来源没有可用的 files 时退回 COPY_FILES。根目录下的子目录（如 bin/）保留结构。
+ */
+export function filesToCopy(srcDir) {
+  let listed = null;
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(srcDir, "package.json"), "utf8"));
+    if (Array.isArray(pkg?.files) && pkg.files.length) listed = pkg.files.filter((f) => typeof f === "string" && f);
+  } catch { listed = null; }
+  const names = listed ?? COPY_FILES;
+  return [...new Set([...names, "package.json"])];
+}
 /** 优先用的稳定 node 路径（Homebrew 升级 node 后这两个软链还在；nvm 的带版本号路径卸了就没了） */
 export const STABLE_NODES = ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
 export const ONLY_MAC = "开机自启目前只支持 Mac 和 Windows";
@@ -93,23 +113,13 @@ ${envXml}
 
 // @意图#R725(2026-11-03): Windows 建软链要管理员权限（或开开发者模式），小白没有。所以 Windows 用一个 current.txt 记当前版本号，
 // 包装脚本读它来找要跑的 runner.mjs。Mac 仍用 current 软链（先建临时链再改名，换的那一下不会断）。
-/** 把运行器复制到 <home>/bin/<版本>/。返回要跑的 runner.mjs 路径。 */
-export function installCopy({ srcDir, version, env = process.env, platform = process.platform }) {
+/** 把「当前版本」指向 <版本>（Mac 改 current 软链，Windows 写 current.txt）。返回要跑的 runner.mjs 路径。 */
+export function switchCurrent({ version, env = process.env, platform = process.platform }) {
   const binRoot = path.join(runnerHome(env), "bin");
-  const dest = path.join(binRoot, version);
-  mkdirSync(dest, { recursive: true, mode: 0o700 });
-  if (real(srcDir) !== real(dest)) {
-    for (const f of COPY_FILES) {
-      const from = path.join(srcDir, f);
-      if (existsSync(from)) copyFileSync(from, path.join(dest, f));
-    }
-    // @意图#R943(2026-11-24): grep 的 rg 二进制来自 @vscode/ripgrep（含平台包）；复制自己时带上依赖，缺了就走 node 降级路
-    const depSrc = path.join(srcDir, "node_modules", "@vscode");
-    if (existsSync(depSrc)) cpSync(depSrc, path.join(dest, "node_modules", "@vscode"), { recursive: true });
-  }
   if (platform === "win32") {
+    mkdirSync(binRoot, { recursive: true, mode: 0o700 });
     writeFileSync(path.join(binRoot, "current.txt"), version);
-    return path.join(dest, "runner.mjs");
+    return path.join(binRoot, version, "runner.mjs");
   }
   const cur = path.join(binRoot, "current");
   const tmp = path.join(binRoot, `.current-${process.pid}`);
@@ -117,6 +127,31 @@ export function installCopy({ srcDir, version, env = process.env, platform = pro
   symlinkSync(version, tmp);
   renameSync(tmp, cur);
   return path.join(cur, "runner.mjs");
+}
+
+/**
+ * 把运行器复制到 <home>/bin/<版本>/。默认同时把 current 指向它并返回要跑的 runner.mjs 路径。
+ * R977：`switchCurrent: false` 时只摆文件、不动当前版本指针（升级路径用：新版真接上了再换指针，
+ * 否则拉不起来时 launchd 会一直去跑那个还没验证过的新副本）。
+ */
+export function installCopy({ srcDir, version, env = process.env, platform = process.platform, switchCurrent: doSwitch = true }) {
+  const binRoot = path.join(runnerHome(env), "bin");
+  const dest = path.join(binRoot, version);
+  mkdirSync(dest, { recursive: true, mode: 0o700 });
+  if (real(srcDir) !== real(dest)) {
+    for (const f of filesToCopy(srcDir)) {
+      const from = path.join(srcDir, f);
+      if (!existsSync(from)) continue;
+      const to = path.join(dest, f);
+      mkdirSync(path.dirname(to), { recursive: true, mode: 0o700 });
+      copyFileSync(from, to);
+    }
+    // @意图#R943(2026-11-24): grep 的 rg 二进制来自 @vscode/ripgrep（含平台包）；复制自己时带上依赖，缺了就走 node 降级路
+    const depSrc = path.join(srcDir, "node_modules", "@vscode");
+    if (existsSync(depSrc)) cpSync(depSrc, path.join(dest, "node_modules", "@vscode"), { recursive: true });
+  }
+  if (!doSwitch) return path.join(dest, "runner.mjs");
+  return switchCurrent({ version, env, platform });
 }
 
 /**

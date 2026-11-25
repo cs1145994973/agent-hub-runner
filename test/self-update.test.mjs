@@ -2,12 +2,12 @@
 // 校验对不上、查不到、已经是最新，都不得替换；指令不带参数，版本号自己查。
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { integrityOk } from "../autostart.mjs";
-import { handleSelfUpdate, selfUpdate, spawnUpdated } from "../runner.mjs";
+import { integrityOk, switchCurrent } from "../autostart.mjs";
+import { handleSelfUpdate, pointCurrentAtSelf, selfUpdate, spawnUpdated } from "../runner.mjs";
 
 const sha512 = (buf) => `sha512-${createHash("sha512").update(buf).digest("base64")}`;
 
@@ -137,5 +137,97 @@ describe("R750 运行器自己升级", () => {
       wait: async () => ({ pid: 124 }),
     });
     assert.deepEqual(foreground[1].slice(1), ["start"]);
+  });
+
+  // @意图#R977(2026-11-25): 跨版本升级回归。旧版的白名单比新包少（0.10.x 没有 official.mjs / oauth.bundle.mjs / search-ops.mjs），
+  // 以前拿旧白名单去筛新包，装出来的副本缺模块、一启动就 ERR_MODULE_NOT_FOUND，于是「新版没接上」。
+  it("U8 拷什么以新包自己的 package.json files 为准：新版本新增的模块不会被旧白名单删掉，装出来能启动", async () => {
+    const home = path.join(base, "u8");
+    const src = path.join(base, "src8");
+    mkdirSync(path.join(src, "bin"), { recursive: true });
+    // 新包：files 里既有旧版知道的，也有旧版压根不知道的
+    const newFiles = ["runner.mjs", "ops.mjs", "autostart.mjs", "search-ops.mjs", "official.mjs", "oauth.bundle.mjs", "brand-new.mjs", "bin/agent-hub-runner.mjs"];
+    for (const f of newFiles) writeFileSync(path.join(src, f), `${f}\n`);
+    writeFileSync(path.join(src, "package.json"), JSON.stringify({ version: "9.9.9", files: newFiles }));
+    // 包里多余的东西（README、没声明的文件）不该跟过去
+    writeFileSync(path.join(src, "README.md"), "readme");
+    writeFileSync(path.join(src, "stray.mjs"), "stray");
+    const buf = Buffer.from("包");
+    const r = await selfUpdate({
+      env: { AGENT_RUNNER_HOME: home }, platform: "darwin", currentVersion: "0.3.1",
+      fetchLatest: async () => ({ version: "9.9.9", integrity: sha512(buf), tarball: "https://registry.npmjs.org/x.tgz" }),
+      download: async () => buf,
+      extract: async () => src,
+      spawnNext: async () => {},
+    });
+    assert.deepEqual(r, { ok: true, version: "9.9.9" });
+    const dest = path.join(home, "bin", "9.9.9");
+    for (const f of newFiles) assert.ok(existsSync(path.join(dest, f)), `新版本声明的 ${f} 必须复制过去`);
+    assert.ok(existsSync(path.join(dest, "bin", "agent-hub-runner.mjs")), "子目录结构要保留");
+    assert.equal(existsSync(path.join(dest, "README.md")), false);
+    assert.equal(existsSync(path.join(dest, "stray.mjs")), false);
+  });
+
+  // @意图#R977(2026-11-25): 失败不能把「当前版本」指到没验证过的新副本，否则 launchd 会一直去跑它。
+  it("U9 新版没接上时当前版本指针不动；新版真起来自己换了才换", async () => {
+    const home = path.join(base, "u9");
+    const src = path.join(base, "src9");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(path.join(src, "runner.mjs"), "// new");
+    writeFileSync(path.join(src, "package.json"), JSON.stringify({ version: "9.9.9", files: ["runner.mjs"] }));
+    // 先摆一个「现在在跑的版本」
+    mkdirSync(path.join(home, "bin", "1.0.0"), { recursive: true });
+    switchCurrent({ version: "1.0.0", env: { AGENT_RUNNER_HOME: home }, platform: "darwin" });
+    assert.equal(readlinkSync(path.join(home, "bin", "current")), "1.0.0");
+    const buf = Buffer.from("包");
+    const common = {
+      env: { AGENT_RUNNER_HOME: home }, platform: "darwin", currentVersion: "1.0.0",
+      fetchLatest: async () => ({ version: "9.9.9", integrity: sha512(buf), tarball: "x" }),
+      download: async () => buf,
+      extract: async () => src,
+    };
+    const bad = await selfUpdate({ ...common, spawnNext: async () => { throw new Error("新版没有接上"); } });
+    assert.equal(bad.ok, false);
+    assert.match(bad.error, /没接上/);
+    assert.equal(readlinkSync(path.join(home, "bin", "current")), "1.0.0", "失败时绝不能把 current 换到新版");
+    // 成功路：旧版只摆文件＋拉起；指针由新版自己拿到锁后校正（这里用 pointCurrentAtSelf 代表新版那一步）
+    const good = await selfUpdate({ ...common, spawnNext: async ({ version }) => {
+      assert.equal(readlinkSync(path.join(home, "bin", "current")), "1.0.0", "拉起新版之前指针必须还是旧的");
+      pointCurrentAtSelf({ version, env: common.env, hereDir: path.join(home, "bin", version), platform: "darwin" });
+    } });
+    assert.deepEqual(good, { ok: true, version: "9.9.9" });
+    assert.equal(readlinkSync(path.join(home, "bin", "current")), "9.9.9");
+    // @意图#R977(2026-11-25): 旧版自己**不**碰指针。新版拿锁但还没校正指针时，selfUpdate 返回后指针应仍是旧的；
+    //   如果旧版又偷偷写了一份（两份各写一次），这里就会变成 9.9.9——锁住「写 current 只有一处」。
+    const home2 = path.join(base, "u9b");
+    const env2 = { AGENT_RUNNER_HOME: home2 };
+    mkdirSync(path.join(home2, "bin", "1.0.0"), { recursive: true });
+    switchCurrent({ version: "1.0.0", env: env2, platform: "darwin" });
+    const r = await selfUpdate({
+      env: env2, platform: "darwin", currentVersion: "1.0.0",
+      fetchLatest: async () => ({ version: "9.9.9", integrity: sha512(buf), tarball: "x" }),
+      download: async () => buf, extract: async () => src,
+      spawnNext: async () => {}, // 新版起来了，但还没走到校正指针那一步
+    });
+    assert.deepEqual(r, { ok: true, version: "9.9.9" });
+    assert.equal(readlinkSync(path.join(home2, "bin", "current")), "1.0.0", "旧版不能自己写指针，写 current 只能有一处");
+  });
+
+  // @意图#R977(2026-11-25): 新版拿到锁后自己把指针指向自己；不在这份副本里跑的（npx 缓存/源码目录）不能碰指针。
+  it("U10 新版启动时只在自己就是 bin/<版本>/ 里跑才校正 current；npx/源码目录跑的不动", () => {
+    const home = path.join(base, "u10");
+    const env = { AGENT_RUNNER_HOME: home };
+    const dest = path.join(home, "bin", "3.3.3");
+    mkdirSync(dest, { recursive: true });
+    mkdirSync(path.join(home, "bin", "1.1.1"), { recursive: true });
+    switchCurrent({ version: "1.1.1", env, platform: "darwin" });
+    // 不在自己的副本里跑（如 npx 缓存）：不动
+    assert.equal(pointCurrentAtSelf({ version: "3.3.3", env, hereDir: path.join(base, "npx-cache"), platform: "darwin" }), false);
+    assert.equal(readlinkSync(path.join(home, "bin", "current")), "1.1.1");
+    // 就在自己的副本里跑：指向自己
+    assert.equal(pointCurrentAtSelf({ version: "3.3.3", env, hereDir: dest, platform: "darwin" }), true);
+    assert.equal(readlinkSync(path.join(home, "bin", "current")), "3.3.3");
+    // 已经指着自己：不重复动（返回 false，不报错）
+    assert.equal(pointCurrentAtSelf({ version: "3.3.3", env, hereDir: dest, platform: "darwin" }), false);
   });
 });
