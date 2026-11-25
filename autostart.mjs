@@ -9,7 +9,7 @@
 // - launchctl 调用可以换成假的（测试用：参数里传，或环境变量 AGENT_RUNNER_LAUNCHCTL 指一个假程序），目录可以用 AGENT_RUNNER_HOME、AGENT_RUNNER_LAUNCH_AGENTS 换到临时目录。
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 // @意图#R725(2026-11-03): Windows 开机自启用计划任务（schtasks）。和 Mac 一样：登录时拉起、崩溃了重新跑、正常退出不拉起。
 import os from "node:os";
 import path from "node:path";
@@ -20,7 +20,7 @@ export const THROTTLE_S = 10;
 /** 复制到 ~/.agent-runner/bin/<版本>/ 的文件（package.json 用来读版本号） */
 // @意图#R729(2026-11-04): 多复制 browser.mjs（runner.mjs 要 import 它）
 // @意图#R690(2026-11-01): 多复制 changes.mjs（runner.mjs 要 import 它，少了开机自启的副本起不来）
-export const COPY_FILES = ["runner.mjs", "ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "package.json"]; // search.mjs：R751 联网搜索（零依赖，拷文件即可）
+export const COPY_FILES = ["runner.mjs", "ops.mjs", "search-ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "official.mjs", "oauth.bundle.mjs", "package.json"]; // search.mjs：R751 联网搜索；official.mjs + oauth.bundle.mjs：R912 官方套餐；search-ops.mjs：R943 grep/find/ls
 /** 优先用的稳定 node 路径（Homebrew 升级 node 后这两个软链还在；nvm 的带版本号路径卸了就没了） */
 export const STABLE_NODES = ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
 export const ONLY_MAC = "开机自启目前只支持 Mac 和 Windows";
@@ -103,6 +103,9 @@ export function installCopy({ srcDir, version, env = process.env, platform = pro
       const from = path.join(srcDir, f);
       if (existsSync(from)) copyFileSync(from, path.join(dest, f));
     }
+    // @意图#R943(2026-11-24): grep 的 rg 二进制来自 @vscode/ripgrep（含平台包）；复制自己时带上依赖，缺了就走 node 降级路
+    const depSrc = path.join(srcDir, "node_modules", "@vscode");
+    if (existsSync(depSrc)) cpSync(depSrc, path.join(dest, "node_modules", "@vscode"), { recursive: true });
   }
   if (platform === "win32") {
     writeFileSync(path.join(binRoot, "current.txt"), version);

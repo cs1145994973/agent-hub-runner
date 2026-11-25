@@ -1,6 +1,7 @@
 // 验证「把 opBash 换成 PowerShell」时要注意的几件事，不连服务器。
 // 用法（在 Windows 上）：node test-ps.mjs
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 const PS = "powershell.exe";
 const PS_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-OutputFormat", "Text", "-Command"];
@@ -10,11 +11,12 @@ function run(cmd, { ms = 20000 } = {}) {
     const t0 = Date.now();
     const child = spawn(PS, [...PS_ARGS, cmd], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let out = "";
-    child.stdout.on("data", (d) => (out += d.toString("utf8")));
-    child.stderr.on("data", (d) => (out += d.toString("utf8")));
+    const dec = new StringDecoder("utf8");
+    child.stdout.on("data", (d) => (out += dec.write(d)));
+    child.stderr.on("data", (d) => (out += dec.write(d)));
     const timer = setTimeout(() => { out += "\n[TIMEOUT]"; child.kill("SIGKILL"); }, ms);
     child.on("error", (e) => { clearTimeout(timer); resolve({ err: `${e.code ?? ""} ${e.message}`, out, ms: Date.now() - t0 }); });
-    child.on("close", (code, sig) => { clearTimeout(timer); resolve({ code, sig, out: out.trim(), ms: Date.now() - t0 }); });
+    child.on("close", (code, sig) => { clearTimeout(timer); out += dec.end(); resolve({ code, sig, out: out.trim(), ms: Date.now() - t0 }); });
   });
 }
 

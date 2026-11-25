@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { editText } from "./edit.mjs";
 import { opContextSnapshot } from "./project-context.mjs";
+import { opGrep, opFind, opLs } from "./search-ops.mjs";
 
 export const MAX_READ_BYTES = 20 * 1024 * 1024;
 /** bash 没给 timeout 时的默认上限（秒），到点杀掉整个进程组。 */
@@ -190,5 +191,9 @@ export function runOp(op, args, root, extra) {
   if (op === "edit") return opEdit(a, root, extra);
   if (op === "bash") return opBash(a, root, extra);
   if (op === "context_snapshot") return opContextSnapshot(a, root); // 固定扫授权根，忽略路径参数
+  // @意图#R943(2026-11-24): grep/find/ls 转发版（pi 内置同名工具搜服务器 cwd，搜不到用户电脑）
+  if (op === "grep") return opGrep(a, root, extra);
+  if (op === "find") return opFind(a, root, extra);
+  if (op === "ls") return opLs(a, root, extra);
   return Promise.reject(new Error(`未知操作 ${op}`));
 }

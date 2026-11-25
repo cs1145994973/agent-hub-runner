@@ -1,13 +1,13 @@
 // @意图#R636(2026-10-27): 运行器单测：路径解析、读写改、跑命令、超时和中止杀进程。
 // @意图#R758(2026-11-08): 工作目录只是默认 cwd；绝对路径、../、~ 和指向目录外的符号链接都允许访问（整台电脑）。
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, statSync, writeFileSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
+import { spawnSync } from "node:child_process";
 import { opBash, opEdit, opRead, opWrite, resolveInside, shellFor } from "../ops.mjs";
 import { parseArgs, saveConfig, loadConfig } from "../runner.mjs";
-import { statSync } from "node:fs";
 
 let base;
 let root;
@@ -72,25 +72,82 @@ describe("R636 运行器：路径", () => {
   });
 });
 
+const isWin = process.platform === "win32";
+/** 进程还在不在（Windows 用 tasklist，POSIX 用 kill 0）。 */
+function isAlive(pid) {
+  if (!pid) return false;
+  if (!isWin) { try { process.kill(pid, 0); return true; } catch { return false; } }
+  const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH"], { encoding: "utf8", windowsHide: true });
+  return String(r.stdout ?? "").includes(String(pid));
+}
+
 describe("R636 运行器：bash", () => {
-  it("B1 工作目录是授权目录，输出边跑边给", async () => {
+  it("B1 工作目录是授权目录，输出边跑边给", { skip: isWin ? "bash 语法；Windows 看 B1w" : false }, async () => {
     const chunks = [];
     const r = await opBash({ command: "pwd; echo hi >&2; exit 3" }, root, { onData: (d) => chunks.push(String(d)) });
     assert.equal(r.exitCode, 3);
-    assert.match(chunks.join(""), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(chunks.join(""), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\/g, "\\\\")));
     assert.match(chunks.join(""), /hi/);
   });
-  it("B2 超时杀掉整个进程组", async () => {
+  // @意图#R944(2026-11-24): Windows 版 B1：PowerShell 写当前目录 + 写 stderr + 退出码 3（中文/退出码靠 -EncodedCommand + exit $LASTEXITCODE）
+  it("B1w Windows：当前目录、错误输出、退出码 3", { skip: isWin ? false : "Windows only" }, async () => {
+    const chunks = [];
+    const r = await opBash({ command: "(Get-Location).Path; Write-Error 'hi'; exit 3" }, root, { onData: (d) => chunks.push(String(d)) });
+    assert.equal(r.exitCode, 3);
+    assert.ok(chunks.join("").includes(root), `输出里应有工作目录：${chunks.join("")}`);
+    assert.match(chunks.join(""), /hi/);
+    // 错误流不能是 CLIXML 垃圾
+    assert.ok(!chunks.join("").includes("CLIXML"), "错误流不应出现 CLIXML");
+  });
+  it("B2 超时杀掉整个进程组", { skip: isWin ? "bash 语法；Windows 看 B2w" : false }, async () => {
     const t0 = Date.now();
     const r = await opBash({ command: "sleep 30 & sleep 30; echo done", timeout: 0.5 }, root);
     assert.equal(r.timedOut, true);
     assert.ok(Date.now() - t0 < 5000);
   });
-  it("B3 中止信号杀进程", async () => {
+  // @意图#R944(2026-11-24): Windows 版 B2：超时后 taskkill /T /F 要把 PowerShell 的子进程一起杀掉（Windows 没有负进程组）
+  it("B2w Windows：超时 taskkill /T 连子进程一起杀", { skip: isWin ? false : "Windows only" }, async () => {
+    const mark = path.join(root, "child.pid");
+    rmSync(mark, { force: true });
+    // 起一个子 powershell 睡 60 秒，把它的 pid 写进文件，父再睡 30 秒等待被杀
+    const cmd = [
+      `$c = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru -WindowStyle Hidden`,
+      `$c.Id | Out-File -FilePath '${mark.replace(/\\/g, "/")}' -Encoding ascii`,
+      "Start-Sleep -Seconds 30",
+    ].join("; ");
+    const t0 = Date.now();
+    const r = await opBash({ command: cmd, timeout: 2 }, root);
+    assert.equal(r.timedOut, true);
+    assert.ok(Date.now() - t0 < 20000, `超时没及时返回：${Date.now() - t0}ms`);
+    const childPid = Number(readFileSync(mark, "utf8").trim());
+    assert.ok(childPid > 0, "应拿到子进程 pid");
+    // taskkill 是同步的，但进程退出可能有毫秒延迟，给一点宽限
+    let alive = true;
+    for (let i = 0; i < 20 && alive; i++) {
+      alive = isAlive(childPid);
+      if (alive) await new Promise((r2) => setTimeout(r2, 100));
+    }
+    assert.equal(alive, false, `子进程 ${childPid} 应被 taskkill /T 杀掉`);
+  });
+  it("C1p POSIX：配置文件权限 600", { skip: isWin ? "Windows 无 POSIX 权限位" : false }, () => {
+    const f = path.join(base, "cfg", "config.json");
+    saveConfig({ token: "t", dir: root }, f);
+    assert.equal(statSync(f).mode & 0o777, 0o600);
+  });
+  it("B3 中止信号杀进程", { skip: isWin ? "bash 语法；Windows 看 B3w" : false }, async () => {
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 200);
     const r = await opBash({ command: "sleep 30" }, root, { signal: ac.signal });
     assert.equal(r.aborted, true);
+  });
+  // @意图#R944(2026-11-24): Windows 版 B3：中止也走 taskkill
+  it("B3w Windows：中止信号杀掉 PowerShell 及其子进程", { skip: isWin ? false : "Windows only" }, async () => {
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 800);
+    const t0 = Date.now();
+    const r = await opBash({ command: "Start-Sleep -Seconds 30" }, root, { signal: ac.signal });
+    assert.equal(r.aborted, true);
+    assert.ok(Date.now() - t0 < 15000, `中止没及时返回：${Date.now() - t0}ms`);
   });
   it("B4 timeout 不合法报错", async () => {
     await assert.rejects(opBash({ command: "true", timeout: -1 }, root), /Invalid timeout/);
@@ -113,10 +170,9 @@ describe("R636 运行器：bash", () => {
 });
 
 describe("R636 运行器：配置", () => {
-  it("C1 配置文件权限 600，参数解析", () => {
+  it("C1 配置文件保存与读取，参数解析", () => {
     const f = path.join(base, "cfg", "config.json");
     saveConfig({ token: "t", dir: root }, f);
-    assert.equal(statSync(f).mode & 0o777, 0o600);
     assert.equal(loadConfig(f).dir, root);
     assert.deepEqual(parseArgs(["pair", "ABCD", "--dir", "/x"]), { cmd: "pair", positional: ["ABCD"], dir: "/x" });
     assert.throws(() => parseArgs(["start", "--bad"]), /不认识的参数/);

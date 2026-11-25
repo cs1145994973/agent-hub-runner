@@ -30,9 +30,10 @@ import { buildChangeRecord, changesDirFor, CHANGE_ID_RE, createChangeStore } fro
 import { browserStatus, createBrowserManager, installBrowser } from "./browser.mjs";
 import { searchWeb, cleanSearchConfig, searchConfigStatus } from "./search.mjs"; // R751
 import { uploadLocalFile } from "./file-upload.mjs"; // R823
+import { createOfficial } from "./official.mjs"; // R912
 import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, COPY_FILES, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, truncateLogIfBig } from "./autostart.mjs";
 
-export const PROTOCOL_VERSION = 3; // R773：remove_binding（软删除 bot 时解除本机目录绑定）
+export const PROTOCOL_VERSION = 4; // R773：remove_binding（软删除 bot 时解除本机目录绑定）；R912：官方套餐登录 / 模型请求转发
 /** npm 包名，也是装好后的命令名 */
 export const PKG_BIN = "agent-hub-runner";
 /** R666：抽屉里给的、npx 运行时提示里写的命令前缀（@latest：每次都用最新版，也不会被电脑上旧的全局安装盖掉） */
@@ -48,6 +49,26 @@ export const CLOSE_BAD_TOKEN = 4401;
 export const CLOSE_REVOKED = 4403;
 /** R666：同一台电脑又连上来一个（同一份配置开了两个运行器），服务器把旧的这条用 4409 断开：不再重连 */
 export const CLOSE_REPLACED = 4409;
+
+// @意图#R957(2026-11-24): 短断不杀活。断线主因是 Mac 睡眠/DarkWake 唤醒（见知识库「运行器断线跟进」），
+// 醒来 2 秒就重连；以前一断就 killAll，任务白干。现在给一个宽限期：命令继续跑，发不出去的
+// 输出/结果按调用 id 攒着，重连后补发；宽限到点还没连上才杀。停止/吊销/顶掉仍照旧立即杀。
+export const RESUME_GRACE_MS = 60_000;
+/** 只保这些「有确定结果」的调用；浏览器/搜索/上传/选目录不保。powershell 是 Windows 上的 bash。 */
+export const RESUMABLE_OPS = new Set(["read", "write", "edit", "bash", "powershell", "grep", "find", "ls"]);
+/** 攒输出的上限（每个调用）：超了丢最旧的输出，结果一定留。 */
+export const RESUME_BUFFER_BYTES = 256 * 1024;
+
+// @意图#R952(2026-11-24): 运行器自己的事件循环卡顿监测（只观测）。
+// 心跳是 setInterval 发的，本进程卡住就发不出去，服务器那边会按超时判离线；
+// 断开日志里带上自己的卡顿值，才能和服务器日志对照出是谁卡住。
+export function loopLagMonitor(everyMs = 1_000) {
+  let last = Date.now(), lag = 0, max = 0, stopped = false;
+  const drift = () => (stopped ? 0 : Math.max(0, Date.now() - last - everyMs));
+  const timer = setInterval(() => { lag = drift(); if (lag > max) max = lag; last = Date.now(); }, everyMs);
+  timer.unref?.();
+  return { lagMs: () => Math.max(lag, drift()), maxMs: () => Math.max(max, drift()), stop: () => { stopped = true; clearInterval(timer); } };
+}
 
 // @意图#R666(2026-10-29): 默认目录可用 AGENT_RUNNER_HOME 换（测试、开机自启的副本用）；不设时和原来一样是 ~/.agent-runner/config.json
 export const configPath = () => process.env.AGENT_RUNNER_CONFIG || path.join(runnerHome(), "config.json");
@@ -167,8 +188,8 @@ export function pickDirWindows({ signal, spawn: spawnFn = spawn } = {}) {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    let out = "";
-    let err = "";
+    const outChunks = [];
+    const errChunks = [];
     let settled = false;
     const settle = (fn, v) => { if (!settled) { settled = true; signal?.removeEventListener("abort", onAbort); fn(v); } };
     const killIt = () => {
@@ -177,10 +198,12 @@ export function pickDirWindows({ signal, spawn: spawnFn = spawn } = {}) {
     };
     const onAbort = () => { killIt(); settle(reject, Object.assign(new Error("已中止"), { name: "AbortError" })); };
     if (signal) { if (signal.aborted) return onAbort(); signal.addEventListener("abort", onAbort, { once: true }); }
-    child.stdout?.on("data", (d) => { out += d.toString("utf8"); });
-    child.stderr?.on("data", (d) => { err += d.toString("utf8"); });
+    child.stdout?.on("data", (d) => { outChunks.push(d); });
+    child.stderr?.on("data", (d) => { errChunks.push(d); });
     child.on("error", (e) => settle(reject, new Error(`弹不出选文件夹的窗口（${e?.message ?? e}）`)));
     child.on("close", () => {
+      const out = Buffer.concat(outChunks).toString("utf8");
+      const err = Buffer.concat(errChunks).toString("utf8");
       const picked = out.trim();
       if (picked) return settle(resolve, picked);
       const why = err.trim().split("\n")[0].trim();
@@ -315,8 +338,10 @@ const wsUrlOf = (server) => `${server.replace(/^http/, "ws")}/devices/ws`;
 // 新消息 change_get {id, change_id} → change_result {id, ok:true, found, record}，不看这个 bot 有没有目录（换了目录也能看旧记录）
 // @意图#R729(2026-11-04): 新消息 browser {id, bot_id, action, args} → result（截图或元素清单）、browser_open {id, bot_id} → result（网页点「打开 bot 的浏览器」）；
 // 浏览器不看这个 bot 有没有选目录（资料目录在 ~/.agent-runner/browser-profiles/<bot_id>/，和授权目录无关）；断线不关浏览器（重连后接着用）
-export function createSession(cfg, { log = say, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), changes, browser, search } = {}) {
+// @意图#R912(2026-11-20): 多管官方套餐（official.mjs）：登录 / 退出 / 模型请求转发都交给它，令牌只写本机配置；测试可注入 oauth / fetch
+export function createSession(cfg, { log = say, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), changes, browser, search, oauth, modelFetch } = {}) {
   const searchImpl = search ?? searchWeb; // R751：测试注入，默认真搜
+  const official = createOfficial(cfg, { save: () => saveConfig(cfg, file), log, oauth, ...(modelFetch ? { fetchImpl: modelFetch } : {}) });
   const sharedLibrary = libraryDir();
   let dirs = botDirsOf(cfg); // bot_id → 工作目录
   let browsers = browser; // R729：每个 bot 一只浏览器，用到时才建
@@ -348,7 +373,7 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     try { dir = await checkDir(dir); } catch (e) { send({ type: "result", id, ok: false, error: e?.message ?? String(e) }); return; }
     const ac = new AbortController();
     jobs.set(id, ac);
-    log(`[${bot}] ${op === "bash" ? `bash：${args?.command}` : `${op}：${args?.path}`}`);
+    log(`[${bot}] ${op === "bash" ? `bash：${args?.command}` : op === "grep" || op === "find" ? `${op}：${args?.pattern}` : `${op}：${args?.path}`}`);
     try {
       const onChange = op === "write" || op === "edit" ? recorder(args) : undefined;
       const res = await runOp(op, args, dir, { signal: ac.signal, onChange, onData: (d) => send({ type: "output", id, data: Buffer.from(d).toString("base64") }) });
@@ -494,6 +519,8 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
 
   return {
     get botDirs() { return { ...dirs }; },
+    /** R912：这台电脑登录了哪些官方套餐（hello 报给服务器；不带令牌） */
+    officialStatus() { return official.status(); },
     /** R690：清掉 30 天前的改动记录（startRunner 启动时调一次） */
     cleanChanges() { return changeStore().clean(true).catch(() => 0); },
     onMessage(msg, send) {
@@ -507,10 +534,12 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       if (msg.type === "browser_open") return handleBrowserOpen(send, msg); // R729
       if (msg.type === "search") return handleSearch(send, msg); // R751
       if (msg.type === "search_config") return handleSearchConfig(send, msg); // R751
-      if (msg.type === "abort") { jobs.get(msg.id)?.abort(); picks.get(msg.id)?.abort(); }
+      if (official.handles(msg.type)) return official.onMessage(msg, send); // R912
+      if (msg.type === "abort") { jobs.get(msg.id)?.abort(); picks.get(msg.id)?.abort(); official.abort(msg.id); }
       return undefined;
     },
     killAll() {
+      official.killAll(); // R912
       for (const ac of jobs.values()) ac.abort();
       for (const ac of picks.values()) ac.abort();
       jobs.clear();
@@ -533,7 +562,7 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
 // @意图#R640(2026-10-27): hello 报 bot→目录 对照表（bot_dirs），不再报单一 dir
 // @意图#R639(2026-10-27): 没目录也能连上；目录由 createSession 管（网页上选完马上生效），重连时 hello 带当前目录
 // @意图#R636(2026-10-27): 前台运行、心跳、执行工具调用；断线时杀掉正在跑的命令，重连后不重放
-export function startRunner(cfg, { log = say, retryMs = 2000, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), background = process.env.AGENT_RUNNER_LAUNCHD === "1", selfUpdate: selfUpdateFn } = {}) {
+export function startRunner(cfg, { log = say, retryMs = 2000, platform = process.platform, pickDir = platform === "win32" ? pickDirWindows : pickDirMac, file = configPath(), background = process.env.AGENT_RUNNER_LAUNCHD === "1", selfUpdate: selfUpdateFn, resumeGraceMs = RESUME_GRACE_MS } = {}) {
   checkNode();
   let fails = 0;
   const session = createSession(cfg, { log, pickDir, platform, file });
@@ -542,10 +571,36 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
   let stopped = false;
   let beat = null;
   let retry = null;
+  const lag = loopLagMonitor(); // R952：只观测，不改心跳与重连行为
+  let connectedAt = 0; // R952：本次连上的时刻
+  let lastRecvAt = 0; // R952：最后一次收到服务器消息（含 pong）的时刻；只记账，不做保活判定
   let resolveDone;
   const done = new Promise((r) => { resolveDone = r; });
   const finish = (why) => { if (!stopped) { stopped = true; } resolveDone(why); };
   const send = (sock, msg) => { if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(msg)); };
+  // ---- R957：断线保活与补发 ----
+  const resumable = new Map(); // 调用 id → 已攒输出字节数（只记可续传的普通工具调用）
+  const outbox = []; // 断线期间攒下的 { id, msg }，重连后按顺序补发
+  let resumeTimer = null;
+  const dropResume = () => { clearTimeout(resumeTimer); resumeTimer = null; outbox.length = 0; resumable.clear(); };
+  /** 统一出口：能发就发；发不出去且是可续传调用的输出/结果，就攒起来等重连。 */
+  const deliver = (msg) => {
+    if (ws && ws.readyState === WebSocket.OPEN) { send(ws, msg); if (msg.type === "result") resumable.delete(msg.id); return; }
+    if (!resumeTimer || (msg.type !== "output" && msg.type !== "result") || !resumable.has(msg.id)) return;
+    if (msg.type === "output") {
+      const size = String(msg.data ?? "").length;
+      let used = resumable.get(msg.id) ?? 0;
+      while (used + size > RESUME_BUFFER_BYTES) { // 丢最旧的输出，给新输出和结果腾位置
+        const i = outbox.findIndex((x) => x.id === msg.id && x.msg.type === "output");
+        if (i < 0) break;
+        used -= String(outbox[i].msg.data ?? "").length;
+        outbox.splice(i, 1);
+      }
+      if (used + size > RESUME_BUFFER_BYTES) return;
+      resumable.set(msg.id, used + size);
+    }
+    outbox.push({ id: msg.id, msg });
+  };
   const browserInfo = () => { try { const b = browserStatus(); return { installed: b.installed, version: b.version }; } catch { return { installed: false, version: null }; } };
 
   // @意图#R839(2026-11-15): R750 的入口曾调用不存在的 runSelfUpdate，网页一点就 ReferenceError；这里真正接上 handleSelfUpdate。
@@ -573,33 +628,61 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
     const sock = new WebSocket(wsUrlOf(cfg.server));
     ws = sock;
     sock.addEventListener("open", () => {
+      connectedAt = Date.now(); lastRecvAt = connectedAt; // R952
       send(sock, { type: "hello", version: PROTOCOL_VERSION, device_id: cfg.device_id, token: cfg.token, bot_dirs: session.botDirs, library_dir: libraryDir(),
-        name: cfg.name ?? os.hostname(), os: `${process.platform} ${os.release()}`, runner_version: RUNNER_VERSION, autostart: background, browser: browserInfo(), search: searchConfigStatus(cfg.search) });
+        name: cfg.name ?? os.hostname(), os: `${process.platform} ${os.release()}`, runner_version: RUNNER_VERSION, autostart: background, browser: browserInfo(), search: searchConfigStatus(cfg.search), official: session.officialStatus(), resume: true }); // R912：official 只报登录了哪几家；R957：resume 告知服务器本运行器支持断线续传
       beat = setInterval(() => send(sock, { type: "ping", browser: browserInfo() }), HEARTBEAT_MS);
     });
     sock.addEventListener("message", (ev) => {
+      lastRecvAt = Date.now(); // R952：任何服务器消息都算收到（pong 也走这里）
       let msg;
       try { msg = JSON.parse(typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8")); } catch { return; }
       if (msg.type === "ready") {
         fails = 0;
+        // @意图#R957(2026-11-24): 连回来了——取消「宽限到点就杀」，把攒下的输出/结果按顺序补发。
+        clearTimeout(resumeTimer); resumeTimer = null;
+        if (outbox.length) {
+          const n = outbox.length;
+          for (const { msg: m } of outbox.splice(0)) { send(sock, m); if (m.type === "result") resumable.delete(m.id); }
+          log(`断线期间的 ${n} 条输出/结果已补发。`);
+        }
+        // 注意：不能整个 clear——还在跑的调用要留着 id，下次再断才能继续保活。
         const n = Object.keys(session.botDirs).length;
         const tail = background ? "（开机自启，在后台运行）" : "按 Ctrl-C 断开。";
         log(n ? `已连上服务器 ${cfg.server}，${n} 个 bot 选了目录。${tail}`
           : `已连上服务器 ${cfg.server}，还没有 bot 选目录：请在网页上每个 bot 的私聊里点输入框下面「我的电脑」那一行，再点「选择目录」。${tail}`);
-      } else if (msg.type === "revoked") { session.killAll(); log("网页上已断开这台电脑，令牌已作废。要再连，请在网页上重新拿配对码配对。"); }
+      } else if (msg.type === "revoked") { session.killAll(); dropResume(); log("网页上已断开这台电脑，令牌已作废。要再连，请在网页上重新拿配对码配对。"); }
       else if (msg.type === "self_update") { void runSelfUpdate(sock); }
-      else void session.onMessage(msg, (m) => send(sock, m));
+      else {
+        // R957：记下可续传的普通工具调用，断线时只攒它们的输出/结果
+        if (msg.type === "call" && RESUMABLE_OPS.has(msg.op) && typeof msg.id === "string") resumable.set(msg.id, 0);
+        void session.onMessage(msg, deliver);
+      }
     });
     sock.addEventListener("close", (ev) => {
       clearInterval(beat);
-      session.killAll(); // 断线：正在跑的命令杀掉、弹窗关掉，服务器那边按「设备离线」返回，重连后不重放
       if (ws === sock) ws = null;
+      // @意图#R957(2026-11-24): 不再一断就杀活。正常/异常链路断开先保活，给宽限期等重连；
+      // 停止、令牌失效、吊销、被顶掉仍照旧立即杀（不给被吊销的设备留活口）。
+      const terminal = stopped || ev.code === CLOSE_BAD_TOKEN || ev.code === CLOSE_REVOKED || ev.code === CLOSE_REPLACED;
+      if (terminal) { session.killAll(); dropResume(); }
+      else if (!resumeTimer && resumable.size) {
+        resumeTimer = setTimeout(() => {
+          log(`断线超过 ${resumeGraceMs / 1000} 秒没连回来，把还在跑的 ${resumable.size} 个调用停掉。`);
+          session.killAll(); dropResume();
+        }, resumeGraceMs);
+        resumeTimer.unref?.();
+      } else if (!resumable.size) { session.killAll(); } // 没活可保：照旧清理弹窗等
       if (stopped) return;
       if (ev.code === CLOSE_BAD_TOKEN) { log("服务器不认这个令牌（可能已经在网页上断开过）。请重新配对。"); finish("bad_token"); return; }
       if (ev.code === CLOSE_REVOKED) { log("这台电脑已在网页上断开。请重新配对。"); finish("revoked"); return; }
       if (ev.code === CLOSE_REPLACED) { log("同一份配置在别处又开了一个运行器，服务器把这个顶掉了：这个先退出（不再重连）。"); finish("replaced"); return; }
       fails += 1;
-      if (fails === 1 || fails % 30 === 0) log(`和服务器的连接断了，${retryMs / 1000} 秒后重连${fails > 1 ? `（已经连不上 ${fails} 次，会一直重试）` : ""}`);
+      // @意图#R952(2026-11-24): 把断开原因记清楚：close code / reason、本次连了多久、
+      // 最后一次收到服务器消息距今多久、自己卡顿了多久。判定与重连间隔一行不改。
+      const now = Date.now();
+      const detail = `code=${ev.code} reason=${ev.reason || "-"} upMs=${connectedAt ? now - connectedAt : 0} sinceRecvMs=${lastRecvAt ? now - lastRecvAt : -1} lagMs=${lag.lagMs()} lagMaxMs=${lag.maxMs()}`;
+      if (fails === 1 || fails % 30 === 0) log(`和服务器的连接断了（${detail}），${retryMs / 1000} 秒后重连${fails > 1 ? `（已经连不上 ${fails} 次，会一直重试）` : ""}`);
       setTimeout(connect, retryMs);
     });
     sock.addEventListener("error", () => { /* close 里处理 */ });
@@ -609,9 +692,11 @@ export function startRunner(cfg, { log = say, retryMs = 2000, platform = process
     if (stopped) return;
     stopped = true;
     session.killAll();
+    dropResume(); // R957
     void session.closeBrowsers(); // R729
     clearInterval(beat);
     clearTimeout(retry);
+    lag.stop(); // R952
     try { ws?.close(1000, "runner stopped"); } catch { /* ignore */ }
     resolveDone("stopped");
   };

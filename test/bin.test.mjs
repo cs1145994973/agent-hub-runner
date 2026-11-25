@@ -1,3 +1,4 @@
+// @意图#R912(2026-11-20): B5 files 多 official.mjs + oauth.bundle.mjs（官方套餐，打包好的单文件，dependencies 仍然没有）；B3 复制的源码也带上它们
 // @意图#R745(2026-11-06): 从客户已授权目录加载项目规则并按需提供技能
 // @意图#R729(2026-11-04): B5 版本 0.2.0、files 多 browser.mjs（浏览器组件不进依赖，dependencies 仍然没有）；B3 复制的源码也带上它
 // @意图#R722(2026-11-03): B5 版本跟着 package.json 改成 0.1.3（904c90c 发 0.1.3 时漏改，测试一直挂着）
@@ -51,7 +52,7 @@ describe("R664 npm 小工具的运行方式", () => {
   it("B3 文件在 node_modules 里（Windows 的 .cmd 是直接 node 这个文件）：也写 agent-hub-runner；仓库里跑 bin 写 node 相对路径", async () => {
     const pkg = path.join(tmp, "lib", "node_modules", PKG_BIN);
     mkdirSync(path.join(pkg, "bin"), { recursive: true });
-    for (const f of ["runner.mjs", "ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f));
+    for (const f of ["runner.mjs", "ops.mjs", "search-ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "official.mjs", "oauth.bundle.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f));
     cpSync(binFile, path.join(pkg, "bin", "agent-hub-runner.mjs"));
     const r = await run(process.execPath, [path.join(pkg, "bin", "agent-hub-runner.mjs")], { cwd: tmp });
     assert.ok(r.stdout.includes("agent-hub-runner pair <配对码>"), r.stdout);
@@ -84,8 +85,9 @@ describe("R664 npm 小工具的运行方式", () => {
     assert.match(p.version, /^\d+\.\d+\.\d+$/); // R723：只校版本号格式，发版不用再改这条
     assert.equal(p.type, "module");
     assert.deepEqual(p.bin, { [PKG_BIN]: "bin/agent-hub-runner.mjs" });
-    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser-recorder.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "file-upload.mjs", "ops.mjs", "project-context.mjs", "runner.mjs", "search.mjs", "tab-recorder.mjs"]);
+    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser-recorder.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "file-upload.mjs", "oauth.bundle.mjs", "official.mjs", "ops.mjs", "project-context.mjs", "runner.mjs", "search-ops.mjs", "search.mjs", "tab-recorder.mjs"]);
     assert.equal(p.engines.node, ">=22");
-    assert.equal(p.dependencies, undefined);
+    // R943：第一个依赖 @vscode/ripgrep（grep 的 rg 二进制，缺了走 node 降级）
+    assert.deepEqual(p.dependencies, { "@vscode/ripgrep": "^1.18.0" });
   });
 });

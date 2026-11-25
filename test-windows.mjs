@@ -30,6 +30,11 @@ await fs.mkdir(path.join(root, "sub"), { recursive: true });
 await step("read 相对路径 a.txt", () => runOp("read", { path: "a.txt" }, root));
 await step("read 绝对路径", () => runOp("read", { path: path.join(root, "a.txt") }, root));
 await step("read 目录 sub", () => runOp("read", { path: "sub" }, root));
+// @意图#R943(2026-11-24): grep/find/ls 跨平台真机步（中文关键词验编码；rg 缺二进制自动降 node）
+await step("grep 中文关键词（rg 或 node 降级）", () => runOp("grep", { pattern: "第一行" }, root));
+await step("grep 带 context 和 limit", () => runOp("grep", { pattern: "行", context: 1, limit: 5 }, root));
+await step("find glob *.txt", () => runOp("find", { pattern: "*.txt" }, root));
+await step("ls 根目录", () => runOp("ls", {}, root));
 await step("read ~/winroot/a.txt", () => runOp("read", { path: "~/winroot/a.txt" }, root));
 await step("write sub/b.txt", () => runOp("write", { path: "sub/b.txt", content: "hello world\n" }, root));
 await step("edit sub/b.txt", () => runOp("edit", { path: "sub/b.txt", edits: [{ oldText: "hello", newText: "HELLO" }] }, root));
