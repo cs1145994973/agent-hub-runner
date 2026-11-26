@@ -2,6 +2,7 @@
 // 服务器把模型请求经 WebSocket 交给这里，换上真令牌、改掉服务器指纹头再发给官方固定域名，回复分段回传；登录 / 刷新用 pi-ai 打包的 oauth.bundle.mjs。
 // 第一期四家：kimi-coding、xai（Grok）、github-copilot、openai-codex（king 定，不做 Anthropic / Gemini）。
 import os from "node:os";
+import { isManualProvider, prepareManual } from "./manual.mjs";
 
 /** 四家官方套餐：hosts = 只许发往的固定域名（https）；hostSuffix = Copilot 按令牌里的 proxy-ep 换地址，只认这个后缀 */
 export const OFFICIAL = {
@@ -116,6 +117,9 @@ export function createOfficial(cfg, { save, log = () => {}, oauth, fetchImpl = (
 
   /** 把服务器转来的请求改成发往官方的真请求：地址白名单、去掉服务器给的鉴权、换真令牌、改指纹 */
   async function prepare(msg) {
+    // @意图#R982(2026-11-25): 手动 API key 服务商（hub_ 前缀）走 prepareManual：不换鉴权原样转发、key 不落盘；
+    // 官方套餐仍走地址白名单＋换真令牌（互不影响）。
+    if (isManualProvider(msg.provider)) return prepareManual(msg);
     const provider = msg.provider;
     const spec = OFFICIAL[provider];
     if (!spec) throw new OfficialError("unknown", OFFICIAL_ERR.unknown);

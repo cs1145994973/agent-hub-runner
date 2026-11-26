@@ -52,7 +52,7 @@ describe("R664 npm 小工具的运行方式", () => {
   it("B3 文件在 node_modules 里（Windows 的 .cmd 是直接 node 这个文件）：也写 agent-hub-runner；仓库里跑 bin 写 node 相对路径", async () => {
     const pkg = path.join(tmp, "lib", "node_modules", PKG_BIN);
     mkdirSync(path.join(pkg, "bin"), { recursive: true });
-    for (const f of ["runner.mjs", "ops.mjs", "search-ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "official.mjs", "oauth.bundle.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f));
+    for (const f of ["runner.mjs", "ops.mjs", "search-ops.mjs", "project-context.mjs", "edit.mjs", "changes.mjs", "browser.mjs", "browser-recorder.mjs", "tab-recorder.mjs", "file-upload.mjs", "autostart.mjs", "search.mjs", "official.mjs", "manual.mjs", "oauth.bundle.mjs", "package.json"]) cpSync(path.join(root, f), path.join(pkg, f)); // R982：复制清单带 manual.mjs（official.mjs import 它，缺了 ERR_MODULE_NOT_FOUND）
     cpSync(binFile, path.join(pkg, "bin", "agent-hub-runner.mjs"));
     const r = await run(process.execPath, [path.join(pkg, "bin", "agent-hub-runner.mjs")], { cwd: tmp });
     assert.ok(r.stdout.includes("agent-hub-runner pair <配对码>"), r.stdout);
@@ -85,7 +85,8 @@ describe("R664 npm 小工具的运行方式", () => {
     assert.match(p.version, /^\d+\.\d+\.\d+$/); // R723：只校版本号格式，发版不用再改这条
     assert.equal(p.type, "module");
     assert.deepEqual(p.bin, { [PKG_BIN]: "bin/agent-hub-runner.mjs" });
-    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser-recorder.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "file-upload.mjs", "oauth.bundle.mjs", "official.mjs", "ops.mjs", "project-context.mjs", "runner.mjs", "search-ops.mjs", "search.mjs", "tab-recorder.mjs"]);
+    // R982：发布清单新增 manual.mjs（手动服务商从电脑发转发分支）；自升级按 files 派生，缺它会装出残缺副本
+    assert.deepEqual([...p.files].sort(), ["README.md", "autostart.mjs", "bin/agent-hub-runner.mjs", "browser-recorder.mjs", "browser.mjs", "changes.mjs", "edit.mjs", "file-upload.mjs", "manual.mjs", "oauth.bundle.mjs", "official.mjs", "ops.mjs", "project-context.mjs", "runner.mjs", "search-ops.mjs", "search.mjs", "tab-recorder.mjs"]);
     assert.equal(p.engines.node, ">=22");
     // R943：第一个依赖 @vscode/ripgrep（grep 的 rg 二进制，缺了走 node 降级）
     assert.deepEqual(p.dependencies, { "@vscode/ripgrep": "^1.18.0" });
