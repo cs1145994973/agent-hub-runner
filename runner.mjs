@@ -30,6 +30,7 @@ import { buildChangeRecord, changesDirFor, CHANGE_ID_RE, createChangeStore } fro
 import { browserStatus, createBrowserManager, installBrowser } from "./browser.mjs";
 import { searchWeb, cleanSearchConfig, searchConfigStatus } from "./search.mjs"; // R751
 import { uploadLocalFile } from "./file-upload.mjs"; // R823
+import { downloadToLibrary } from "./file-download.mjs"; // 意图-q6kvzh
 import { createOfficial } from "./official.mjs"; // R912
 import { autostartOff, autostartOffWindows, autostartOn, autostartOnWindows, autostartStatus, autostartStatusWindows, installCopy, integrityOk, logFileFor, ONLY_MAC, otherAutostarts, runnerHome, switchCurrent, truncateLogIfBig } from "./autostart.mjs";
 
@@ -402,6 +403,22 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
     finally { jobs.delete(id); }
   }
 
+  // @意图-q6kvzh(2026-11-26): 服务器→电脑下载；文件内容走一次性 HTTP 票据，WS 只传指令与结果，落点限在共享资料库。
+  async function handleFileDownload(send, msg) {
+    const { id } = msg;
+    const bot = typeof msg.bot_id === "string" ? msg.bot_id : "";
+    if (!bot) { send({ type: "result", id, ok: false, error: "缺 bot_id" }); return; }
+    const ac = new AbortController(); jobs.set(id, ac);
+    log(`[${bot}] 下载文件：${msg.args?.path || msg.args?.name || msg.args?.attachment_id || ""}`);
+    try {
+      const got = await downloadToLibrary({ server: cfg.server, download: msg.args?.download, path: msg.args?.path, name: msg.args?.name,
+        root: sharedLibrary, signal: ac.signal, maxBytes: msg.args?.max_bytes });
+      if (ac.signal.aborted) send({ type: "result", id, ok: false, error: "已中止" });
+      else send({ type: "result", id, ok: true, ...got });
+    } catch (e) { send({ type: "result", id, ok: false, error: e?.message ?? String(e) }); }
+    finally { jobs.delete(id); }
+  }
+
   // @意图#R729(2026-11-04): bot 用浏览器：全部自动允许（不弹卡）；打字只记字数（可能是密码）
   async function handleBrowser(send, msg) {
     const { id } = msg;
@@ -531,6 +548,7 @@ export function createSession(cfg, { log = say, platform = process.platform, pic
       if (msg.type === "change_get") return handleChangeGet(send, msg);
       if (msg.type === "browser") return handleBrowser(send, msg); // R729
       if (msg.type === "file_upload") return handleFileUpload(send, msg); // R823
+      if (msg.type === "download") return handleFileDownload(send, msg); // 意图-q6kvzh
       if (msg.type === "browser_open") return handleBrowserOpen(send, msg); // R729
       if (msg.type === "search") return handleSearch(send, msg); // R751
       if (msg.type === "search_config") return handleSearchConfig(send, msg); // R751

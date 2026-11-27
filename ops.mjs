@@ -51,6 +51,38 @@ export async function resolveInside(p, root) {
   try { return await realOf(expandPath(p, root)); } catch (e) { throw new Error(`无法解析路径：${p}（${e?.code ?? e?.message ?? e}）`); }
 }
 
+/**
+ * @意图-q6kvzh(2026-11-26): 服务器下发的文件只能落在共享资料库里（king 定：与 bot 自定义工作目录无关）。
+ * 只接受库内相对路径：绝对路径、`..` 越界、符号链接指向库外一律拒绝；父目录自动建；同名不覆盖，加 -2/-3 后缀。
+ * 返回真实绝对落点（字符串），调用方负责写盘。
+ */
+export async function opDownloadTarget(root, relPath) {
+  const libRoot = await realOf(root);
+  if (typeof relPath !== "string" || !relPath.trim()) throw new Error("路径是空的");
+  const raw = relPath.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ").trim();
+  if (raw.startsWith("@")) throw new Error(`不能下载到 ${relPath}：路径要用库内相对路径（例如 素材/a.png）`);
+  if (path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("~")) {
+    throw new Error(`不能下载到 ${relPath}：只能用共享资料库内的相对路径（例如 素材/a.png）`);
+  }
+  if (raw.split(/[\\/]+/).includes("..")) throw new Error(`不能下载到 ${relPath}：路径不能含 ..`);
+  const target = await realOf(path.resolve(libRoot, raw));
+  if (!inside(target, libRoot)) throw new Error(`不能下载到 ${relPath}：只能放在共享资料库里面`);
+  if (target === libRoot) throw new Error(`不能下载到 ${relPath}：要给一个文件名，不能是资料库目录本身`);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  // 建完目录再解一次，防止父目录里藏符号链接把落点带到库外
+  const finalTarget = await realOf(target);
+  if (!inside(finalTarget, libRoot)) throw new Error(`不能下载到 ${relPath}：只能放在共享资料库里面`);
+  const dir = path.dirname(finalTarget);
+  const ext = path.extname(finalTarget);
+  const stem = path.basename(finalTarget, ext);
+  let candidate = finalTarget;
+  for (let n = 2; ; n++) {
+    try { await fs.lstat(candidate); } catch { break; } // 不存在，就用这个
+    candidate = path.join(dir, `${stem}-${n}${ext}`);
+  }
+  return candidate;
+}
+
 function imageMime(buf) {
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
   if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
